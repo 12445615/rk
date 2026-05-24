@@ -31,15 +31,26 @@
 #include "audio_alert.h"//加入语音
 
 #define VIDEO_DEV "/dev/video11"
-#define RTMP_URL "rtmp://10.119.132.231:1935/fire_live/test"
+#define RTMP_URL "rtmp://10.36.113.231:1935/fire_live/test"
 #define WIDTH  1280
 #define HEIGHT 720
 #define BUF_COUNT 4
 #define FRAME_SIZE (WIDTH * HEIGHT * 3 / 2)
 #define SENSOR_DEVICE_ENV "SENSOR_MODBUS_DEV"
 #define SENSOR_DEVICE_DEFAULT "/dev/ttyUSB0"
+#define CAMERA_SENSOR_SUBDEV_ENV "CAMERA_SENSOR_SUBDEV"
+#define CAMERA_SENSOR_SUBDEV_DEFAULT "/dev/v4l-subdev2"
+#define CAMERA_SENSOR_LOCK_ENV "CAMERA_SENSOR_LOCK_FPS"
+#define CAMERA_SENSOR_VBLANK_ENV "CAMERA_SENSOR_VBLANK"
+#define CAMERA_SENSOR_EXPOSURE_ENV "CAMERA_SENSOR_EXPOSURE"
+#define CAMERA_SENSOR_GAIN_ENV "CAMERA_SENSOR_GAIN"
+#define CAMERA_SENSOR_LOCK_INTERVAL_MS 5000
 #define STREAM_RESTART_BASE_MS 1000
 #define STREAM_RESTART_MAX_MS 30000
+#define STREAM_FPS_ENV "CAMERA_FLOW_STREAM_FPS"
+#define STREAM_FPS_DEFAULT 15
+#define STREAM_DUP_FRAMES_ENV "CAMERA_FLOW_DUP_FRAMES"
+#define STREAM_DUP_FRAMES_DEFAULT 1
 #define CHILD_RTMP_RETRY_BASE_MS 1000
 #define CHILD_RTMP_RETRY_MAX_MS 30000
 #define AI_ENABLE_ENV "CAMERA_FLOW_AI_ENABLE"
@@ -257,6 +268,55 @@ static float env_to_float_range(const char *name, float fallback, float min_valu
     }
 
     return parsed;
+}
+
+
+static int set_v4l2_ctrl_value(int fd, unsigned int id, int value, const char *name) {
+    struct v4l2_control ctrl;
+
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = id;
+    ctrl.value = value;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
+        fprintf(stderr, "[Camera][Sensor] set %s=%d failed: %s\n", name, value, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void camera_sensor_lock_fps_controls(void) {
+    const char *subdev;
+    int fd;
+    int vblank;
+    int exposure;
+    int gain;
+
+    if (!env_to_bool_default(CAMERA_SENSOR_LOCK_ENV, 0)) {
+        return;
+    }
+
+    subdev = getenv(CAMERA_SENSOR_SUBDEV_ENV);
+    if (subdev == NULL || subdev[0] == '\0') {
+        subdev = CAMERA_SENSOR_SUBDEV_DEFAULT;
+    }
+
+    vblank = env_to_positive_int(CAMERA_SENSOR_VBLANK_ENV, 78);
+    exposure = env_to_positive_int(CAMERA_SENSOR_EXPOSURE_ENV, 2048);
+    gain = env_to_positive_int(CAMERA_SENSOR_GAIN_ENV, 256);
+
+    fd = open(subdev, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "[Camera][Sensor] open %s failed: %s\n", subdev, strerror(errno));
+        return;
+    }
+
+    set_v4l2_ctrl_value(fd, V4L2_CID_VBLANK, vblank, "vertical_blanking");
+    set_v4l2_ctrl_value(fd, V4L2_CID_EXPOSURE, exposure, "exposure");
+    set_v4l2_ctrl_value(fd, V4L2_CID_ANALOGUE_GAIN, gain, "analogue_gain");
+    close(fd);
+
+    printf("[Camera][Sensor] locked %s vblank=%d exposure=%d gain=%d\n",
+           subdev, vblank, exposure, gain);
 }
 
 static int ai_preprocess_dma_to_rgb_fd(int dma_fd,
@@ -724,7 +784,7 @@ static void child_reset_streamer(ChildOutputCtx *ctx) {
 static int child_open_rtmp_output(ChildOutputCtx *ctx) {
     child_reset_streamer(ctx);
 
-    if (streamer_init(&ctx->streamer, RTMP_URL, WIDTH, HEIGHT, 30) < 0) {
+    if (streamer_init(&ctx->streamer, RTMP_URL, WIDTH, HEIGHT, env_to_positive_int(STREAM_FPS_ENV, STREAM_FPS_DEFAULT)) < 0) {
         fprintf(stderr, "[Child] Streamer init failed for RTMP\n");
         child_reset_streamer(ctx);
         return -1;
@@ -818,7 +878,7 @@ static int child_open_file_segment(ChildOutputCtx *ctx,
     }
 
     child_reset_streamer(ctx);
-    if (streamer_init(&ctx->streamer, segment_path, WIDTH, HEIGHT, 30) < 0) {
+    if (streamer_init(&ctx->streamer, segment_path, WIDTH, HEIGHT, env_to_positive_int(STREAM_FPS_ENV, STREAM_FPS_DEFAULT)) < 0) {
         fprintf(stderr, "[Child] Streamer init failed for local segment\n");
         local_store_delete_video_segment(&ctx->store, segment_id);
         child_reset_streamer(ctx);
@@ -887,12 +947,35 @@ static int child_rotate_or_restore_output(ChildOutputCtx *ctx,
     return 0;
 }
 
+
+static int child_push_frame_repeated(ChildOutputCtx *ctx,
+                                     int dma_fd,
+                                     const DetectSharedState *overlay,
+                                     int repeat_count) {
+    int ret = 0;
+    int i;
+
+    if (repeat_count < 1) {
+        repeat_count = 1;
+    }
+
+    for (i = 0; i < repeat_count; i++) {
+        ret = streamer_push_zerocopy_overlay(&ctx->streamer, dma_fd, overlay);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    return ret;
+}
+
 static int child_stream_loop(int sock, DetectSharedState *detect_state) {
     ChildOutputCtx ctx;
     int64_t frame_mono_ms;
     int64_t frame_wall_ms;
     int child_fd;
     int ret;
+    int duplicate_frames;
 
     install_signal_handlers();
 
@@ -900,6 +983,12 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
     ctx.detect_state = detect_state;
     ctx.rtmp_retry_backoff_ms = CHILD_RTMP_RETRY_BASE_MS;
     ctx.rtmp_retry_max_ms = CHILD_RTMP_RETRY_MAX_MS;
+    duplicate_frames = env_to_positive_int(STREAM_DUP_FRAMES_ENV, STREAM_DUP_FRAMES_DEFAULT);
+    if (duplicate_frames < 1) duplicate_frames = 1;
+    printf("[Child] stream duplicate_frames=%d target_fps=%d\n",
+           duplicate_frames,
+           env_to_positive_int(STREAM_FPS_ENV, STREAM_FPS_DEFAULT));
+
     ctx.debug_rtmp_fail_after_frames = env_to_positive_int("CAMERA_FLOW_DEBUG_RTMP_FAIL_AFTER_FRAMES", 0);
     if (ctx.debug_rtmp_fail_after_frames > 0) {
         printf("[Child] Debug RTMP fail will trigger after %d frames.\n",
@@ -955,17 +1044,17 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
                 fprintf(stderr, "[Child] Debug: simulate RTMP disconnect at frame %d.\n",
                         ctx.debug_rtmp_frame_count);
             } else {
-                ret = streamer_push_zerocopy_overlay(&ctx.streamer, child_fd, overlay);
+                ret = child_push_frame_repeated(&ctx, child_fd, overlay, duplicate_frames);
             }
         } else {
-            ret = streamer_push_zerocopy_overlay(&ctx.streamer, child_fd, overlay);
+            ret = child_push_frame_repeated(&ctx, child_fd, overlay, duplicate_frames);
         }
 
         if (ret < 0) {
             if (ctx.mode == CHILD_OUTPUT_RTMP && ctx.video_store_ready) {
                 fprintf(stderr, "[Child] RTMP push failed, switch to local file mode.\n");
                 if (child_switch_to_file_mode(&ctx, frame_mono_ms, frame_wall_ms) == 0) {
-                    ret = streamer_push_zerocopy_overlay(&ctx.streamer, child_fd, overlay);
+                    ret = child_push_frame_repeated(&ctx, child_fd, overlay, duplicate_frames);
                     if (ret == 0) {
                         char ack = 'k';
                         if (write(sock, &ack, 1) <= 0) {
@@ -1105,6 +1194,7 @@ int main(void) {
     uint64_t stream_frames = 0;
     uint64_t stream_failures = 0;
     int64_t last_video_stats_ms = 0;
+    int64_t last_sensor_lock_ms = 0;
 
     memset(&video_uploader, 0, sizeof(video_uploader));
     memset(&ai_pipeline, 0, sizeof(ai_pipeline));
@@ -1125,6 +1215,8 @@ int main(void) {
         memset(detect_state, 0, sizeof(*detect_state));
         stream.detect_state = detect_state;
     }
+
+    camera_sensor_lock_fps_controls();
 
     if (camera_init(&cam, VIDEO_DEV, WIDTH, HEIGHT) < 0) {
         fprintf(stderr, "Failed to init camera\n");
@@ -1163,6 +1255,7 @@ int main(void) {
         perror("camera start failed");
         goto cleanup;
     }
+    camera_sensor_lock_fps_controls();
     if (osd_cache_init("/root/MOD20.TTF", 32) != 0) {
         fprintf(stderr, "[Parent] OSD 字模初始化失败，视频将不显示文字！\n");
     }
@@ -1261,6 +1354,11 @@ int main(void) {
                     stream_frames++;
                 }
             }
+        }
+
+        if (last_sensor_lock_ms == 0 || frame_mono_ms - last_sensor_lock_ms >= CAMERA_SENSOR_LOCK_INTERVAL_MS) {
+            camera_sensor_lock_fps_controls();
+            last_sensor_lock_ms = frame_mono_ms;
         }
 
         ai_pipeline_process_frame(&ai_pipeline, current_dma_fd, frame_wall_ms);

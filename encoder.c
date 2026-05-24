@@ -83,6 +83,7 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     // ==== 核心抗延迟配置 1：强行要求 FFmpeg 不做任何包积压 ====
 
     s->fmt_ctx->flags |= AVFMT_FLAG_FLUSH_PACKETS; 
+    s->fmt_ctx->max_delay = 0; 
 
 
 
@@ -129,17 +130,17 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     // ========================================================
     // 【抗刷屏优化开始】
     // 1. 修改 GOP 大小为 60（约两秒一个I帧），减少频繁的大包刷新导致的卡顿
-    s->enc_ctx->gop_size = 30; 
+    s->enc_ctx->gop_size = fps; 
     
     s->enc_ctx->max_b_frames = 0;
     s->enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
     
    // 1. 基础码率提升到 3Mbps，保证日常清晰度
-    s->enc_ctx->bit_rate = 4000000; 
+    s->enc_ctx->bit_rate = 2000000; 
     
     // 2. 【核心】最大码率放宽到 6Mbps，允许在摄像头剧烈移动时“爆发”码流，吃透动态画面！
-    s->enc_ctx->rc_max_rate = 8000000; 
-    s->enc_ctx->rc_buffer_size = 2000000;
+    s->enc_ctx->rc_max_rate = 2000000; 
+    s->enc_ctx->rc_buffer_size = 300000;
 
     // 3. 【核心】放宽最高压缩比 (qmax)
     // qmin 保持 18（保证静止画面极其清晰）
@@ -159,6 +160,8 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     av_dict_set(&codec_opts, "tune", "zerolatency", 0);
     av_dict_set(&codec_opts, "rc_mode", "CBR", 0);
     av_dict_set(&codec_opts, "profile", "baseline", 0);
+    av_dict_set(&codec_opts, "bf", "0", 0);
+    av_dict_set(&codec_opts, "delay", "0", 0);
 
     if (avcodec_open2(s->enc_ctx, codec, &codec_opts) < 0) {
 
@@ -471,8 +474,12 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
     rga_buffer_t src, dst;
 
     IM_STATUS status;
-
-
+    int64_t push_start_ms;
+    int64_t push_end_ms;
+    static int64_t stat_start_ms = 0;
+    static uint64_t stat_frames = 0;
+    static int64_t stat_total_ms = 0;
+    static int64_t stat_max_ms = 0;
 
     // 静态变量：用于平滑数值
 
@@ -482,7 +489,8 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
     if (dma_fd < 0 || !s->yuv_frame->data[0]) return -1;
 
-
+    push_start_ms = get_mono_time_ms();
+    if (stat_start_ms == 0) stat_start_ms = push_start_ms;
 
     // 1. 内存准备 (保持对齐)
 
@@ -627,7 +635,14 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
     s->yuv_frame->data[1] = s->yuv_frame->data[0] + (s->yuv_frame->linesize[0] * 768);
     s->yuv_frame->linesize[1] = s->width;
 
-    s->yuv_frame->pts = s->frame_pts++;
+    int fps = s->enc_ctx->framerate.num > 0 ? s->enc_ctx->framerate.num : 30;
+    int64_t now_ms = get_mono_time_ms();
+    int64_t target_pts = (now_ms - g_stream_start_ms) * fps / 1000;
+    if (target_pts <= s->frame_pts) {
+        target_pts = s->frame_pts + 1;
+    }
+    s->frame_pts = target_pts;
+    s->yuv_frame->pts = s->frame_pts;
     s->yuv_frame->pkt_duration = 1;
 
     ret = avcodec_send_frame(s->enc_ctx, s->yuv_frame);
@@ -656,6 +671,23 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
     }
 
     av_packet_free(&pkt);
+
+    push_end_ms = get_mono_time_ms();
+    stat_frames++;
+    stat_total_ms += push_end_ms - push_start_ms;
+    if (push_end_ms - push_start_ms > stat_max_ms) {
+        stat_max_ms = push_end_ms - push_start_ms;
+    }
+    if (push_end_ms - stat_start_ms >= 5000) {
+        double sec = (double)(push_end_ms - stat_start_ms) / 1000.0;
+        double avg_ms = stat_frames > 0 ? (double)stat_total_ms / (double)stat_frames : 0.0;
+        printf("[Child][Encode] fps=%.1f avg_ms=%.2f max_ms=%lld pts=%lld\n",
+               stat_frames / sec, avg_ms, (long long)stat_max_ms, (long long)s->frame_pts);
+        stat_start_ms = push_end_ms;
+        stat_frames = 0;
+        stat_total_ms = 0;
+        stat_max_ms = 0;
+    }
 
     return 0;
 

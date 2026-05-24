@@ -11,7 +11,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 
-// 初始化摄像头并分配内存映射
+// Initialize camera and mmap buffers
 int camera_init(CameraCtx *ctx, const char *dev_name, int width, int height) {
     ctx->fd = open(dev_name, O_RDWR);
     if (ctx->fd < 0) {
@@ -32,6 +32,27 @@ int camera_init(CameraCtx *ctx, const char *dev_name, int width, int height) {
     if (ioctl(ctx->fd, VIDIOC_S_FMT, &fmt) < 0) {
         perror("camera SetFormat");
         return -1;
+    }
+
+    struct v4l2_streamparm parm;
+    memset(&parm, 0, sizeof(parm));
+    parm.type = ctx->buf_type;
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = 30;
+    if (ioctl(ctx->fd, VIDIOC_S_PARM, &parm) < 0) {
+        perror("camera set 30fps warning");
+    }
+    memset(&parm, 0, sizeof(parm));
+    parm.type = ctx->buf_type;
+    if (ioctl(ctx->fd, VIDIOC_G_PARM, &parm) == 0 &&
+        parm.parm.capture.timeperframe.numerator > 0 &&
+        parm.parm.capture.timeperframe.denominator > 0) {
+        double fps = (double)parm.parm.capture.timeperframe.denominator /
+                     (double)parm.parm.capture.timeperframe.numerator;
+        printf("[Camera] driver frame interval=%u/%u fps=%.2f\n",
+               parm.parm.capture.timeperframe.numerator,
+               parm.parm.capture.timeperframe.denominator,
+               fps);
     }
 
     struct v4l2_requestbuffers req;
@@ -77,18 +98,15 @@ int camera_init(CameraCtx *ctx, const char *dev_name, int width, int height) {
     }
     return 0;
 }
-
-// 开启数据流
+// Start capture stream
 int camera_start(CameraCtx *ctx) {
     return ioctl(ctx->fd, VIDIOC_STREAMON, &ctx->buf_type);
 }
-
-// 停止数据流
+// Stop capture stream
 int camera_stop(CameraCtx *ctx) {
     return ioctl(ctx->fd, VIDIOC_STREAMOFF, &ctx->buf_type);
 }
-
-// 释放资源
+// Release resources
 void camera_deinit(CameraCtx *ctx) {
     for (int i = 0; i < BUF_COUNT; i++) {
         if (ctx->buffers[i].start && ctx->buffers[i].start != MAP_FAILED) {

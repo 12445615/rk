@@ -1,0 +1,5 @@
+kask var
+kask yok
+yelek var
+yelek yok
+fire

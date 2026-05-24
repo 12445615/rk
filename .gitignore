@@ -1,0 +1,21 @@
+# Build outputs
+*.o
+main
+
+# Local backup/temp files
+*.bak_codex
+*.tmp
+*.log
+
+# Runtime/local data
+*.db
+*.sqlite
+*.mp4
+*.flv
+*.h264
+*.h265
+
+# Editor/system
+.vscode/
+.DS_Store
+Thumbs.db

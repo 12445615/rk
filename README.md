@@ -1,5 +1,35 @@
 # ELF2 Camera Flow
 
+## 本分支说明：STM32 串口通信底座
+
+当前分支新增 RK3588 与 STM32 安全下位机的串口通信底座，目标是先跑通双方通信，不改变现有 AI 识别、视频采集、RTMP 推流、MQTT 上报、音频报警和视频落盘逻辑。
+
+本分支新增内容：
+
+- 新增 `safety_interlock_client.c/.h`
+- 默认使用 `/dev/ttyS9` 与 STM32 通信
+- 串口参数为 `115200 8N1`
+- RK3588 每 `500ms` 发送一次二进制心跳帧
+- 支持统一帧格式：`A5 5A | VERSION | TYPE | SEQ | LEN | PAYLOAD | CRC16 | 0D`
+- 支持接收 STM32 状态、传感器数据、执行器状态、联锁事件和故障事件
+- 收到 STM32 联锁事件后自动回复 `EVENT_ACK`
+- 旧的 Modbus 传感器线程默认跳过，避免继续占用或查找 `/dev/ttyUSB0`
+
+本分支暂未接入的内容：
+
+- 尚未把现有 RKNN/YOLO 检测结果发送为 `AI_STATUS`
+- 尚未把风险融合结果发送为 `FUSION_DECISION`
+- 尚未把 STM32 上传的传感器数据写入原有 `g_sensor_data`
+- 尚未改动 RTMP 推流、AI 推理、MQTT、音频报警和视频补传逻辑
+
+如果后续需要重新启用旧 Modbus 传感器线程，可在运行前设置：
+
+```bash
+export SENSOR_MODBUS_DISABLE=0
+export SENSOR_MODBUS_DEV=/dev/ttyUSB0
+```
+
+
 这个工程当前包含三条正式业务链路：
 
 - 视频采集与 RTMP 推流

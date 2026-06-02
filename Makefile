@@ -82,7 +82,8 @@ TARGET = main
 # 纯 C 源文件
 C_SRCS = main.c camera.c ipc.c encoder.c aliyun_mqtt.c \
          sensor_modbus.c local_store.c video_store.c \
-         video_uploader.c relay_alarm.c osd_cache.c audio_alert.c
+         video_uploader.c relay_alarm.c osd_cache.c audio_alert.c \
+         safety_interlock_client.c
 
 # C++ 源文件
 CXX_SRCS = postprocess.cc rknn_worker.cc

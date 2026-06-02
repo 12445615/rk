@@ -7,6 +7,7 @@
 #include "video_uploader.h"
 #include "rknn_worker.h"
 #include "relay_alarm.h"
+#include "safety_interlock_client.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -37,6 +38,7 @@
 #define BUF_COUNT 4
 #define FRAME_SIZE (WIDTH * HEIGHT * 3 / 2)
 #define SENSOR_DEVICE_ENV "SENSOR_MODBUS_DEV"
+#define SENSOR_DEVICE_DISABLE_ENV "SENSOR_MODBUS_DISABLE"
 #define SENSOR_DEVICE_DEFAULT "/dev/ttyUSB0"
 #define CAMERA_SENSOR_SUBDEV_ENV "CAMERA_SENSOR_SUBDEV"
 #define CAMERA_SENSOR_SUBDEV_DEFAULT "/dev/v4l-subdev2"
@@ -1188,6 +1190,8 @@ int main(void) {
     VideoUploader video_uploader;
     AiPipeline ai_pipeline;
     AlarmFusion alarm_fusion;
+    SafetyInterlockClient safety_client;
+    int safety_client_started = 0;
     int video_uploader_started = 0;
     char video_uploader_reason[256];
     uint64_t capture_frames = 0;
@@ -1199,8 +1203,20 @@ int main(void) {
     memset(&video_uploader, 0, sizeof(video_uploader));
     memset(&ai_pipeline, 0, sizeof(ai_pipeline));
     memset(&alarm_fusion, 0, sizeof(alarm_fusion));
+    memset(&safety_client, 0, sizeof(safety_client));
 
     install_signal_handlers();
+
+    {
+        int rc = safety_client_init(&safety_client, NULL, 0);
+        if (rc != 0) {
+            fprintf(stderr, "[Parent] Failed to start STM32 safety client: %s\n",
+                    strerror(rc));
+        } else {
+            safety_client_started = 1;
+            printf("[Parent] STM32 safety client started\n");
+        }
+    }
 
     detect_state = mmap(NULL,
                         sizeof(*detect_state),
@@ -1260,7 +1276,7 @@ int main(void) {
         fprintf(stderr, "[Parent] OSD 字模初始化失败，视频将不显示文字！\n");
     }
     
-    {
+    if (!env_to_bool_default(SENSOR_DEVICE_DISABLE_ENV, 1)) {
         const char *sensor_device = getenv(SENSOR_DEVICE_ENV);
         if (sensor_device == NULL || sensor_device[0] == '\0') {
             sensor_device = SENSOR_DEVICE_DEFAULT;
@@ -1273,6 +1289,8 @@ int main(void) {
         } else {
             printf("[Parent] Sensor collector started on %s\n", sensor_device);
         }
+    } else {
+        printf("[Parent] Sensor collector skipped: %s=1\n", SENSOR_DEVICE_DISABLE_ENV);
     }
 
     {
@@ -1393,6 +1411,9 @@ int main(void) {
 
 cleanup:
     is_running = 0;
+    if (safety_client_started) {
+        safety_client_stop(&safety_client);
+    }
     //音频清理
     audio_alert_deinit();
     if (video_uploader_started) {

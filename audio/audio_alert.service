@@ -1,0 +1,13 @@
+[Unit]
+Description=RK3588 Audio Alert IPC Daemon
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/root/run_audio.sh
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

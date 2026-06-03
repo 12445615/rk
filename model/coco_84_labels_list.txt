@@ -1,5 +1,6 @@
-kask var
-kask yok
-yelek var
-yelek yok
+helmet
+no-helmet
+no-vest
+person
+vest
 fire

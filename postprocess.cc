@@ -1,4 +1,5 @@
 #include "postprocess.h"
+#include "Float16.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -7,17 +8,36 @@
 #include <algorithm>
 #include <vector>
 
-// 1. 注入你专属的 5 个标签
-static const char *project_labels[5] = {
-    "kask var",  // 0: 有安全帽
-    "kask yok",  // 1: 无安全帽
-    "yelek var", // 2: 有反光衣
-    "yelek yok", // 3: 无反光衣
-    "fire"       // 4: 火灾
+// 1. 标签顺序必须和训练 data.yaml 保持一致
+static const char *project_labels[OBJ_CLASS_NUM] = {
+    "helmet",    // 0: 有安全帽
+    "no-helmet", // 1: 未戴安全帽
+    "no-vest",   // 2: 未穿反光背心
+    "person",    // 3: 人员
+    "vest",      // 4: 穿反光背心
+    "fire"       // 5: 火光/火警
 };
 
 inline static float clamp(float val, float min, float max) { 
     return val > min ? (val < max ? val : max) : min; 
+}
+
+inline static float sigmoid_if_needed(float val) {
+    if (val >= 0.0f && val <= 1.0f) {
+        return val;
+    }
+    if (val > 20.0f) return 1.0f;
+    if (val < -20.0f) return 0.0f;
+    return 1.0f / (1.0f + expf(-val));
+}
+
+inline static float read_output_value(const rknn_output *output, int index, int elem_count) {
+    if (output->size == (uint32_t)(elem_count * 2)) {
+        const rknpu2::float16 *data = (const rknpu2::float16 *)output->buf;
+        return (float)data[index];
+    }
+    const float *data = (const float *)output->buf;
+    return data[index];
 }
 
 // IOU 计算 (直接沿用你验证通过的代码)
@@ -39,9 +59,56 @@ int post_process(rknn_output *outputs, rknn_tensor_attr *out_attr, int num_outpu
     memset(od_results, 0, sizeof(object_detect_result_list));
     if (num_outputs > 1) return 0;
 
-    float *data = (float *)outputs[0].buf;
-    int num_anchors = 8400;
-    int num_classes = 5;
+    if (outputs == NULL || outputs[0].buf == NULL || out_attr == NULL) {
+        return 0;
+    }
+
+    int elem_count = out_attr[0].n_elems;
+    if (elem_count <= 0 && outputs[0].size > 0) {
+        elem_count = (int)(outputs[0].size / sizeof(float));
+    }
+
+    int num_anchors = 0;
+    int num_classes = 0;
+    int channel_count = 0;
+
+    if (out_attr[0].n_dims >= 3 &&
+        out_attr[0].dims[1] >= 5 &&
+        out_attr[0].dims[1] <= 4 + OBJ_CLASS_NUM &&
+        out_attr[0].dims[2] > 0) {
+        channel_count = out_attr[0].dims[1];
+        num_classes = channel_count - 4;
+        num_anchors = out_attr[0].dims[2];
+    } else {
+        for (int ch = 4 + OBJ_CLASS_NUM; ch >= 5; --ch) {
+            if (elem_count > 0 && elem_count % ch == 0) {
+                channel_count = ch;
+                num_classes = ch - 4;
+                num_anchors = elem_count / ch;
+                break;
+            }
+        }
+    }
+
+    if (num_anchors <= 0 || num_classes <= 0) {
+        static int warned_bad_shape = 0;
+        if (!warned_bad_shape) {
+            fprintf(stderr, "[AI] unsupported output shape: elems=%d size=%u n_dims=%u\n",
+                    elem_count, outputs[0].size, out_attr[0].n_dims);
+            warned_bad_shape = 1;
+        }
+        return 0;
+    }
+    if (num_classes > OBJ_CLASS_NUM) {
+        num_classes = OBJ_CLASS_NUM;
+    }
+
+    static int logged_shape = 0;
+    if (!logged_shape) {
+        fprintf(stderr, "[AI] postprocess output elems=%d channels=%d anchors=%d classes=%d\n",
+                elem_count, channel_count, num_anchors, num_classes);
+        logged_shape = 1;
+    }
 
     // 视频流原始分辨率与模型分辨率
     const int model_w = 640;
@@ -55,27 +122,37 @@ int post_process(rknn_output *outputs, rknn_tensor_attr *out_attr, int num_outpu
     float offset_y = (model_h - cam_h * scale) / 2.0f;
 
     std::vector<object_detect_result> temp_results;
+    float debug_best_prob = -1.0f;
+    int debug_best_class = -1;
+    int debug_best_anchor = -1;
 
     // 2. 遍历 8400 个锚点 (严格采用你昨日验证通过的 NCHW 提取法)
     for (int i = 0; i < num_anchors; ++i) {
-        float max_class_prob = 0.0f;
+        float max_class_prob = -1.0f;
         int max_class_id = -1;
 
-        // 提取 5 个类别中的最高得分
+        // 提取所有类别中的最高得分
         for (int c = 0; c < num_classes; ++c) {
-            float prob = data[(4 + c) * num_anchors + i];
+            float prob = sigmoid_if_needed(read_output_value(&outputs[0],
+                                                              (4 + c) * num_anchors + i,
+                                                              elem_count));
             if (prob > max_class_prob) {
                 max_class_prob = prob;
                 max_class_id = c;
             }
         }
+        if (max_class_prob > debug_best_prob) {
+            debug_best_prob = max_class_prob;
+            debug_best_class = max_class_id;
+            debug_best_anchor = i;
+        }
 
         // 3. 超过阈值才解析坐标 (推荐阈值 0.5)
         if (max_class_prob > conf_threshold) {
-            float cx = data[0 * num_anchors + i];
-            float cy = data[1 * num_anchors + i];
-            float w  = data[2 * num_anchors + i];
-            float h  = data[3 * num_anchors + i];
+            float cx = read_output_value(&outputs[0], 0 * num_anchors + i, elem_count);
+            float cy = read_output_value(&outputs[0], 1 * num_anchors + i, elem_count);
+            float w  = read_output_value(&outputs[0], 2 * num_anchors + i, elem_count);
+            float h  = read_output_value(&outputs[0], 3 * num_anchors + i, elem_count);
 
             // 过滤极端的垃圾框
             if (w <= 0 || h <= 0 || w > 2000) continue;
@@ -98,6 +175,21 @@ int post_process(rknn_output *outputs, rknn_tensor_attr *out_attr, int num_outpu
 
             temp_results.push_back(res);
         }
+    }
+
+    static int debug_no_candidate_logs = 0;
+    if (temp_results.empty() && debug_no_candidate_logs < 20) {
+        const char *name = (debug_best_class >= 0 && debug_best_class < OBJ_CLASS_NUM)
+                               ? project_labels[debug_best_class]
+                               : "unknown";
+        fprintf(stderr,
+                "[AI] no candidates: max_prob=%.6f class=%d(%s) anchor=%d threshold=%.3f\n",
+                debug_best_prob,
+                debug_best_class,
+                name,
+                debug_best_anchor,
+                conf_threshold);
+        debug_no_candidate_logs++;
     }
 
     // 4. 排序与 NMS
@@ -144,6 +236,6 @@ int init_post_process() { return 0; }
 void deinit_post_process() {}
 
 extern "C" char *coco_cls_to_name(int cls_id) {
-    if (cls_id >= 0 && cls_id < 5) return (char*)project_labels[cls_id];
+    if (cls_id >= 0 && cls_id < OBJ_CLASS_NUM) return (char*)project_labels[cls_id];
     return (char*)"未知物体";
 }

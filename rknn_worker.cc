@@ -23,6 +23,7 @@ struct dma_buf_sync {
 #include "rknn_api.h"
 #include "rknn_worker.h"
 #include "postprocess.h"
+#include "Float16.h"
 
 #define MAX_SLOTS 4
 #define MAX_PENDING_JOBS 2
@@ -57,6 +58,28 @@ static int64_t now_us(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+static uint32_t input_rgb_u8_size(void) {
+    if (input_attrs == NULL || input_attrs[0].n_dims < 4) {
+        return 0;
+    }
+    return (uint32_t)(input_attrs[0].dims[1] *
+                      input_attrs[0].dims[2] *
+                      input_attrs[0].dims[3]);
+}
+
+static int input_is_fp16(void) {
+    return input_attrs != NULL && input_attrs[0].type == RKNN_TENSOR_FLOAT16;
+}
+
+static void convert_rgb_u8_to_fp16_inplace(void *buffer, uint32_t rgb_size) {
+    uint8_t *rgb = (uint8_t *)buffer;
+    rknpu2::float16 *fp16 = (rknpu2::float16 *)buffer;
+
+    for (int64_t i = (int64_t)rgb_size - 1; i >= 0; --i) {
+        fp16[i] = (float)rgb[i] / 255.0f;
+    }
 }
 
 static void stats_inc(uint64_t *field) {
@@ -123,17 +146,31 @@ static void process_job(const RknnJob *job) {
         return;
     }
 
-    sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+    sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
     ioctl(slot_mems[job->slot]->fd, DMA_BUF_IOCTL_SYNC, &sync);
 
     rknn_input inputs[1];
     memset(inputs, 0, sizeof(inputs));
     inputs[0].index = 0;
-    inputs[0].type = RKNN_TENSOR_UINT8;
-    inputs[0].size = input_attrs[0].size;
     inputs[0].fmt = RKNN_TENSOR_NHWC;
-    inputs[0].pass_through = 0;
     inputs[0].buf = slot_mems[job->slot]->virt_addr;
+    if (input_rgb_u8_size() == 0) {
+        stats_inc(&g_stats.failed);
+        goto out;
+    }
+    if (input_is_fp16()) {
+        convert_rgb_u8_to_fp16_inplace(slot_mems[job->slot]->virt_addr, input_rgb_u8_size());
+        inputs[0].type = RKNN_TENSOR_FLOAT16;
+        inputs[0].size = input_attrs[0].size;
+        inputs[0].pass_through = 1;
+    } else {
+        inputs[0].type = RKNN_TENSOR_UINT8;
+        inputs[0].size = input_rgb_u8_size();
+        inputs[0].pass_through = 0;
+    }
+
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
+    ioctl(slot_mems[job->slot]->fd, DMA_BUF_IOCTL_SYNC, &sync);
 
     ret = rknn_inputs_set(ctx, io_num.n_input, inputs);
     if (ret < 0) {
@@ -148,9 +185,6 @@ static void process_job(const RknnJob *job) {
         stats_inc(&g_stats.failed);
         goto out;
     }
-
-    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-    ioctl(slot_mems[job->slot]->fd, DMA_BUF_IOCTL_SYNC, &sync);
 
     outputs = (rknn_output*)calloc(io_num.n_output, sizeof(rknn_output));
     if (outputs == NULL) {
@@ -268,6 +302,18 @@ extern "C" int rknn_worker_start(RknnWorker *worker, RknnWorkerConfig *config) {
     for (uint32_t i = 0; i < io_num.n_output; i++) {
         output_attrs[i].index = i;
         rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &(output_attrs[i]), sizeof(rknn_tensor_attr));
+        printf("[AI] output[%u] n_dims=%u dims=[%d,%d,%d,%d] n_elems=%u size=%u fmt=%d type=%d qnt=%d\n",
+               i,
+               output_attrs[i].n_dims,
+               output_attrs[i].dims[0],
+               output_attrs[i].dims[1],
+               output_attrs[i].dims[2],
+               output_attrs[i].dims[3],
+               output_attrs[i].n_elems,
+               output_attrs[i].size,
+               output_attrs[i].fmt,
+               output_attrs[i].type,
+               output_attrs[i].qnt_type);
     }
 
     ret = pthread_create(&g_thread, NULL, infer_thread_main, NULL);
@@ -277,8 +323,8 @@ extern "C" int rknn_worker_start(RknnWorker *worker, RknnWorkerConfig *config) {
     }
     g_thread_started = 1;
 
-    printf("[AI] RKNN async worker started. slots=%d pending=%d input_size=%u conf=%.2f nms=%.2f\n",
-           MAX_SLOTS, MAX_PENDING_JOBS, input_attrs[0].size, g_conf_threshold, g_nms_threshold);
+    printf("[AI] RKNN async worker started. slots=%d pending=%d tensor_size=%u rgb_u8_size=%u conf=%.2f nms=%.2f\n",
+           MAX_SLOTS, MAX_PENDING_JOBS, input_attrs[0].size, input_rgb_u8_size(), g_conf_threshold, g_nms_threshold);
     return 0;
 }
 
@@ -332,7 +378,7 @@ extern "C" int rknn_worker_acquire_input_buffer(RknnWorker *worker, RknnWorkerIn
             buffer->width = input_attrs[0].dims[2];
             buffer->height = input_attrs[0].dims[1];
             buffer->channels = input_attrs[0].dims[3];
-            buffer->size = input_attrs[0].size;
+            buffer->size = input_rgb_u8_size();
             pthread_mutex_unlock(&g_lock);
             return 0;
         }
@@ -394,7 +440,7 @@ extern "C" int rknn_worker_get_input_info(RknnWorker *worker, RknnWorkerInputInf
     info->width = input_attrs[0].dims[2];
     info->height = input_attrs[0].dims[1];
     info->channels = input_attrs[0].dims[3];
-    info->size = input_attrs[0].size;
+    info->size = input_rgb_u8_size();
     return 0;
 }
 

@@ -27,6 +27,8 @@
 
 
 #define ALIGN_TO_2(x) ((x + 1) & ~1)
+#define SAFETY_WORK_ZONE_ENV "SAFETY_WORK_ZONE"
+#define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
 
 
 
@@ -80,7 +82,7 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
 
 
 
-    // ==== ºËÐÄ¿¹ÑÓ³ÙÅäÖÃ 1£ºÇ¿ÐÐÒªÇó FFmpeg ²»×öÈÎºÎ°ü»ýÑ¹ ====
+    // ==== ï¿½ï¿½ï¿½Ä¿ï¿½ï¿½Ó³ï¿½ï¿½ï¿½ï¿½ï¿½ 1ï¿½ï¿½Ç¿ï¿½ï¿½Òªï¿½ï¿½ FFmpeg ï¿½ï¿½ï¿½ï¿½ï¿½ÎºÎ°ï¿½ï¿½ï¿½Ñ¹ ====
 
     s->fmt_ctx->flags |= AVFMT_FLAG_FLUSH_PACKETS; 
     s->fmt_ctx->max_delay = 0; 
@@ -128,23 +130,23 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     s->enc_ctx->framerate = (AVRational){fps, 1};
     
     // ========================================================
-    // ¡¾¿¹Ë¢ÆÁÓÅ»¯¿ªÊ¼¡¿
-    // 1. ÐÞ¸Ä GOP ´óÐ¡Îª 60£¨Ô¼Á½ÃëÒ»¸öIÖ¡£©£¬¼õÉÙÆµ·±µÄ´ó°üË¢ÐÂµ¼ÖÂµÄ¿¨¶Ù
+    // ï¿½ï¿½ï¿½ï¿½Ë¢ï¿½ï¿½ï¿½Å»ï¿½ï¿½ï¿½Ê¼ï¿½ï¿½
+    // 1. ï¿½Þ¸ï¿½ GOP ï¿½ï¿½Ð¡Îª 60ï¿½ï¿½Ô¼ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½IÖ¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æµï¿½ï¿½ï¿½Ä´ï¿½ï¿½Ë¢ï¿½Âµï¿½ï¿½ÂµÄ¿ï¿½ï¿½ï¿½
     s->enc_ctx->gop_size = fps; 
     
     s->enc_ctx->max_b_frames = 0;
     s->enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
     
-   // 1. »ù´¡ÂëÂÊÌáÉýµ½ 3Mbps£¬±£Ö¤ÈÕ³£ÇåÎú¶È
+   // 1. ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 3Mbpsï¿½ï¿½ï¿½ï¿½Ö¤ï¿½Õ³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
     s->enc_ctx->bit_rate = 2000000; 
     
-    // 2. ¡¾ºËÐÄ¡¿×î´óÂëÂÊ·Å¿íµ½ 6Mbps£¬ÔÊÐíÔÚÉãÏñÍ·¾çÁÒÒÆ¶¯Ê±¡°±¬·¢¡±ÂëÁ÷£¬³ÔÍ¸¶¯Ì¬»­Ãæ£¡
+    // 2. ï¿½ï¿½ï¿½ï¿½ï¿½Ä¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê·Å¿ï¿½ï¿½ï¿½ 6Mbpsï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í·ï¿½ï¿½ï¿½ï¿½ï¿½Æ¶ï¿½Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¸ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½æ£¡
     s->enc_ctx->rc_max_rate = 2000000; 
     s->enc_ctx->rc_buffer_size = 300000;
 
-    // 3. ¡¾ºËÐÄ¡¿·Å¿í×î¸ßÑ¹Ëõ±È (qmax)
-    // qmin ±£³Ö 18£¨±£Ö¤¾²Ö¹»­Ãæ¼«ÆäÇåÎú£©
-    // qmax ±ØÐëÀ­¸ßµ½ 45£¨Èç¹ûÀ­µÃÌ«µÍ±ÈÈç32£¬¾çÁÒÔË¶¯Ê±ÂëÂÊ»á³¬±ê£¬Ó²±àÒýÇæ»áÖ±½Ó±¨´í»¨ÆÁ£¬À­¸ßºó×î¶àÊÇ±äÈáºÍ£¬¾ø²»»¨ÆÁËºÁÑ£©
+    // 3. ï¿½ï¿½ï¿½ï¿½ï¿½Ä¡ï¿½ï¿½Å¿ï¿½ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ (qmax)
+    // qmin ï¿½ï¿½ï¿½ï¿½ 18ï¿½ï¿½ï¿½ï¿½Ö¤ï¿½ï¿½Ö¹ï¿½ï¿½ï¿½æ¼«ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+    // qmax ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ßµï¿½ 45ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ì«ï¿½Í±ï¿½ï¿½ï¿½32ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë¶ï¿½Ê±ï¿½ï¿½ï¿½Ê»á³¬ï¿½ê£¬Ó²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö±ï¿½Ó±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ßºï¿½ï¿½ï¿½ï¿½ï¿½Ç±ï¿½ï¿½ï¿½Í£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ëºï¿½Ñ£ï¿½
     s->enc_ctx->qmin = 18;
     s->enc_ctx->qmax = 45;
     s->video_st->time_base = s->enc_ctx->time_base;
@@ -221,7 +223,7 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
 
         av_dict_set(&opts, "rw_timeout", "2000000", 0); 
 
-        // ==== ºËÐÄ¿¹ÑÓ³ÙÅäÖÃ 2£º½ûÓÃÍøÂçµ×²ãÐ´»º³å ====
+        // ==== ï¿½ï¿½ï¿½Ä¿ï¿½ï¿½Ó³ï¿½ï¿½ï¿½ï¿½ï¿½ 2ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×²ï¿½Ð´ï¿½ï¿½ï¿½ï¿½ ====
 
         av_dict_set(&opts, "fflags", "nobuffer", 0); 
         av_dict_set(&opts, "flush_packets", "1", 0);
@@ -323,7 +325,7 @@ int streamer_push(FFmpegStreamer *s, uint8_t *nv12_data)
 
         
 
-        // ==== ºËÐÄ¿¹ÑÓ³ÙÅäÖÃ 3£º²»ÔÙ½»Ö¯µÈ´ýÒôÆµ£¬Ö±½Ó±©Á¦ÍÆÏòÍøÂç ====
+        // ==== ï¿½ï¿½ï¿½Ä¿ï¿½ï¿½Ó³ï¿½ï¿½ï¿½ï¿½ï¿½ 3ï¿½ï¿½ï¿½ï¿½ï¿½Ù½ï¿½Ö¯ï¿½È´ï¿½ï¿½ï¿½Æµï¿½ï¿½Ö±ï¿½Ó±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ====
 
         av_write_frame(s->fmt_ctx, pkt);
 
@@ -359,6 +361,108 @@ static int align_even_down(int value) { return value & ~1; }
 
 static int align_even_up(int value) { return (value + 1) & ~1; }
 
+typedef struct {
+    int valid;
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+} OverlayZoneRect;
+
+static int parse_overlay_zone_rect(const char *env_name, OverlayZoneRect *rect) {
+    const char *value;
+    float x1, y1, x2, y2;
+    char tail;
+
+    if (rect == NULL) {
+        return 0;
+    }
+
+    rect->valid = 0;
+    rect->x1 = 0;
+    rect->y1 = 0;
+    rect->x2 = 0;
+    rect->y2 = 0;
+
+    value = getenv(env_name);
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+
+    if (sscanf(value, " %f , %f , %f , %f %c", &x1, &y1, &x2, &y2, &tail) != 4) {
+        return 0;
+    }
+    if (x2 <= x1 || y2 <= y1) {
+        return 0;
+    }
+
+    rect->valid = 1;
+    rect->x1 = (int)(x1 + 0.5f);
+    rect->y1 = (int)(y1 + 0.5f);
+    rect->x2 = (int)(x2 + 0.5f);
+    rect->y2 = (int)(y2 + 0.5f);
+    return 1;
+}
+
+static void draw_overlay_zone_rect(FFmpegStreamer *s,
+                                   rga_buffer_t dst,
+                                   const OverlayZoneRect *zone,
+                                   int border,
+                                   unsigned int color) {
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+    int width;
+    int height;
+    im_rect rects[4];
+    int edge;
+
+    if (s == NULL || zone == NULL || !zone->valid || border <= 0) {
+        return;
+    }
+
+    x1 = clamp_int(zone->x1, 0, s->width - 2);
+    y1 = clamp_int(zone->y1, 0, s->height - 2);
+    x2 = clamp_int(zone->x2, x1 + border, s->width);
+    y2 = clamp_int(zone->y2, y1 + border, s->height);
+
+    x1 = align_even_down(x1);
+    y1 = align_even_down(y1);
+    x2 = align_even_up(x2);
+    y2 = align_even_up(y2);
+    x2 = clamp_int(x2, x1 + border, s->width);
+    y2 = clamp_int(y2, y1 + border, s->height);
+
+    width = x2 - x1;
+    height = y2 - y1;
+    if (width < border || height < border) {
+        return;
+    }
+
+    rects[0] = (im_rect){x1, y1, width, border};
+    rects[1] = (im_rect){x1, y2 - border, width, border};
+    rects[2] = (im_rect){x1, y1, border, height};
+    rects[3] = (im_rect){x2 - border, y1, border, height};
+
+    for (edge = 0; edge < 4; edge++) {
+        if (imfill_t(dst, rects[edge], color, IM_SYNC) != IM_STATUS_SUCCESS) {
+            return;
+        }
+    }
+}
+
+static void draw_safety_zones(FFmpegStreamer *s, rga_buffer_t dst) {
+    OverlayZoneRect work_zone;
+    OverlayZoneRect danger_zone;
+
+    parse_overlay_zone_rect(SAFETY_DANGER_ZONE_ENV, &danger_zone);
+    parse_overlay_zone_rect(SAFETY_WORK_ZONE_ENV, &work_zone);
+
+    draw_overlay_zone_rect(s, dst, &danger_zone, 6, 0xff0000);
+    draw_overlay_zone_rect(s, dst, &work_zone, 4, 0x00ff00);
+}
+
 
 
 static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect_state) {
@@ -371,13 +475,7 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
 
 
 
-    if (s == NULL || detect_state == NULL || !detect_state->valid || detect_state->box_count <= 0) return;
-
-
-
-    count = detect_state->box_count;
-
-    if (count > DETECT_MAX_BOXES) count = DETECT_MAX_BOXES;
+    if (s == NULL) return;
 
 
 
@@ -386,6 +484,14 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
     dst.wstride = s->yuv_frame->linesize[0];
 
     dst.hstride = 768;
+
+    draw_safety_zones(s, dst);
+
+    if (detect_state == NULL || !detect_state->valid || detect_state->box_count <= 0) return;
+
+    count = detect_state->box_count;
+
+    if (count > DETECT_MAX_BOXES) count = DETECT_MAX_BOXES;
 
 
 
@@ -481,9 +587,9 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
     static int64_t stat_total_ms = 0;
     static int64_t stat_max_ms = 0;
 
-    // ¾²Ì¬±äÁ¿£ºÓÃÓÚÆ½»¬ÊýÖµ
+    // ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½Öµ
 
-    static float smoothed_scores[5] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f}; 
+    static float smoothed_scores[6] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
 
 
 
@@ -492,7 +598,7 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
     push_start_ms = get_mono_time_ms();
     if (stat_start_ms == 0) stat_start_ms = push_start_ms;
 
-    // 1. ÄÚ´æ×¼±¸ (±£³Ö¶ÔÆë)
+    // 1. ï¿½Ú´ï¿½×¼ï¿½ï¿½ (ï¿½ï¿½ï¿½Ö¶ï¿½ï¿½ï¿½)
 
     s->yuv_frame->height = 768;
 
@@ -536,11 +642,11 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
             float raw_score = local.boxes[i].score;
 
-            if (id < 0 || id >= 5) continue;
+            if (id < 0 || id >= 6) continue;
 
 
 
-            // --- Æ½»¬Âß¼­ÐÞ¸´£ºÈç¹ûÊÇµÚÒ»Ö¡£¬Ö±½Ó¸³Öµ ---
+            // --- Æ½ï¿½ï¿½ï¿½ß¼ï¿½ï¿½Þ¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Çµï¿½Ò»Ö¡ï¿½ï¿½Ö±ï¿½Ó¸ï¿½Öµ ---
 
             if (smoothed_scores[id] < 0.0f) smoothed_scores[id] = raw_score;
 
@@ -562,7 +668,7 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
 
 
-            // A. ¸Ç·ÖÀà±êÇ©
+            // A. ï¿½Ç·ï¿½ï¿½ï¿½ï¿½Ç©
 
             GlyphStamp *label = &g_stamp_labels[id];
 
@@ -582,7 +688,7 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
 
 
-            // B. ¸ÇÖÃÐÅ¶È (Ê¹ÓÃÆ½»¬ºóµÄÊýÖµ)
+            // B. ï¿½ï¿½ï¿½ï¿½ï¿½Å¶ï¿½ (Ê¹ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Öµ)
 
             int score_int = (int)(display_score * 100.0f);
 
@@ -614,7 +720,7 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
                 
 
-                // Ö»ÓÐÔÚÕâÀï¼ÓÕâ¸ö´òÓ¡£¬Èç¹ûÃ»¿´µ½Êä³öËµÃ÷¸ù±¾Ã»½øÑ­»·
+                // Ö»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó¡ï¿½ï¿½ï¿½ï¿½ï¿½Ã»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ëµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã»ï¿½ï¿½Ñ­ï¿½ï¿½
 
                 if (status != IM_STATUS_SUCCESS) {
 
@@ -631,7 +737,7 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
     }
 
 
-// ÕýÈ·Ð´·¨£ºÊ¹ÓÃÕæÕýµÄÄÚ´æ¿ç¶È linesize[0] È¥¼ÆËã UV µÄÆðÊ¼µØÖ·
+// ï¿½ï¿½È·Ð´ï¿½ï¿½ï¿½ï¿½Ê¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú´ï¿½ï¿½ï¿½ linesize[0] È¥ï¿½ï¿½ï¿½ï¿½ UV ï¿½ï¿½ï¿½ï¿½Ê¼ï¿½ï¿½Ö·
     s->yuv_frame->data[1] = s->yuv_frame->data[0] + (s->yuv_frame->linesize[0] * 768);
     s->yuv_frame->linesize[1] = s->width;
 

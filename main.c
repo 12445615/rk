@@ -66,6 +66,24 @@
 #define ALARM_FUSION_ON_CONFIRM 3
 #define ALARM_FUSION_OFF_CONFIRM 5
 #define ALARM_FUSION_AI_STALE_MS 1500
+#define SAFETY_AI_SEND_INTERVAL_MS 500
+#define SAFETY_FUSION_SEND_INTERVAL_MS 500
+#define SAFETY_SMOKE_HIGH_ENV "SAFETY_SMOKE_HIGH"
+#define SAFETY_GAS_HIGH_ENV "SAFETY_GAS_HIGH"
+#define SAFETY_TEMP_HIGH_X10_ENV "SAFETY_TEMP_HIGH_X10"
+#define SAFETY_WORK_ZONE_ENV "SAFETY_WORK_ZONE"
+#define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
+#define SAFETY_SMOKE_HIGH_DEFAULT 600
+#define SAFETY_GAS_HIGH_DEFAULT 500
+#define SAFETY_TEMP_HIGH_X10_DEFAULT 600
+#define SAFETY_AI_FLAG_VALID       (1u << 0)
+#define SAFETY_AI_FLAG_PPE_OK      (1u << 1)
+#define SAFETY_AI_FLAG_NO_HELMET   (1u << 2)
+#define SAFETY_AI_FLAG_NO_VEST     (1u << 3)
+#define SAFETY_AI_FLAG_FIRE        (1u << 4)
+#define SAFETY_AI_FLAG_FIRE_OUT    (1u << 5)
+#define SAFETY_AI_FLAG_INTRUSION   (1u << 6)
+#define SAFETY_AI_FLAG_PERSON      (1u << 8)
 
 volatile sig_atomic_t is_running = 1;
 static volatile sig_atomic_t g_video_uploader_signal_ready = 0;
@@ -580,6 +598,434 @@ static int detect_snapshot_read(DetectSharedState *shared, DetectSharedState *sn
     }
 
     return 0;
+}
+
+typedef struct {
+    uint16_t ai_flags;
+    uint8_t ai_confidence;
+    uint8_t permit_decision;
+    uint8_t risk_level;
+    uint8_t risk_type;
+    uint8_t voice_action;
+    uint8_t stm32_action;
+    uint8_t explain_code;
+    int64_t last_ai_send_ms;
+    int64_t last_fusion_send_ms;
+    uint16_t last_ai_flags;
+    uint8_t last_ai_confidence;
+    uint8_t last_permit_decision;
+    uint8_t last_risk_level;
+    uint8_t last_risk_type;
+    uint8_t last_voice_action;
+    uint8_t last_stm32_action;
+    uint8_t last_explain_code;
+    int initialized;
+} SafetyRuntimeState;
+
+typedef struct {
+    int valid;
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+} SafetyZoneRect;
+
+static uint8_t safety_score_to_percent(float score) {
+    if (score <= 0.0f) {
+        return 0;
+    }
+    if (score >= 1.0f) {
+        return 100;
+    }
+    return (uint8_t)(score * 100.0f + 0.5f);
+}
+
+static int safety_parse_zone_rect(const char *env_name, SafetyZoneRect *rect) {
+    const char *value;
+    char *endptr = NULL;
+    float x1, y1, x2, y2;
+
+    if (rect == NULL) {
+        return 0;
+    }
+
+    rect->valid = 0;
+    rect->x1 = 0.0f;
+    rect->y1 = 0.0f;
+    rect->x2 = 0.0f;
+    rect->y2 = 0.0f;
+
+    value = getenv(env_name);
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+
+    errno = 0;
+    x1 = strtof(value, &endptr);
+    if (errno != 0 || endptr == value || *endptr != ',') return 0;
+    value = endptr + 1;
+
+    errno = 0;
+    y1 = strtof(value, &endptr);
+    if (errno != 0 || endptr == value || *endptr != ',') return 0;
+    value = endptr + 1;
+
+    errno = 0;
+    x2 = strtof(value, &endptr);
+    if (errno != 0 || endptr == value || *endptr != ',') return 0;
+    value = endptr + 1;
+
+    errno = 0;
+    y2 = strtof(value, &endptr);
+    if (errno != 0 || endptr == value || *endptr != '\0') return 0;
+    if (x2 <= x1 || y2 <= y1) return 0;
+
+    rect->valid = 1;
+    rect->x1 = x1;
+    rect->y1 = y1;
+    rect->x2 = x2;
+    rect->y2 = y2;
+    return 1;
+}
+
+static int safety_box_center_in_zone(const DetectBox *box, const SafetyZoneRect *rect) {
+    float cx;
+    float cy;
+
+    if (box == NULL || rect == NULL || !rect->valid) {
+        return 0;
+    }
+
+    cx = (box->x1 + box->x2) * 0.5f;
+    cy = (box->y1 + box->y2) * 0.5f;
+    return cx >= rect->x1 && cx <= rect->x2 && cy >= rect->y1 && cy <= rect->y2;
+}
+
+static void safety_build_ai_status(DetectSharedState *shared,
+                                   int64_t now_ms,
+                                   uint16_t *ai_flags_out,
+                                   uint8_t *ai_confidence_out) {
+    DetectSharedState snapshot;
+    uint16_t flags = 0;
+    uint8_t confidence = 0;
+    int has_helmet = 0;
+    int has_vest = 0;
+    int has_no_helmet = 0;
+    int has_no_vest = 0;
+    int has_person = 0;
+    int has_fire = 0;
+    int has_fire_in_work_zone = 0;
+    int has_fire_out_of_work_zone = 0;
+    int has_intrusion = 0;
+    SafetyZoneRect work_zone;
+    SafetyZoneRect danger_zone;
+
+    safety_parse_zone_rect(SAFETY_WORK_ZONE_ENV, &work_zone);
+    safety_parse_zone_rect(SAFETY_DANGER_ZONE_ENV, &danger_zone);
+
+    if (!detect_snapshot_read(shared, &snapshot) ||
+        snapshot.timestamp_ms <= 0 ||
+        now_ms - snapshot.timestamp_ms > ALARM_FUSION_AI_STALE_MS) {
+        *ai_flags_out = 0;
+        *ai_confidence_out = 0;
+        return;
+    }
+
+    flags |= SAFETY_AI_FLAG_VALID;
+
+    for (int i = 0; i < snapshot.box_count; i++) {
+        char *name = coco_cls_to_name(snapshot.boxes[i].class_id);
+        uint8_t score_percent = safety_score_to_percent(snapshot.boxes[i].score);
+        if (score_percent > confidence) {
+            confidence = score_percent;
+        }
+
+        if (strcmp(name, "helmet") == 0) {
+            has_helmet = 1;
+        } else if (strcmp(name, "no-helmet") == 0) {
+            has_no_helmet = 1;
+        } else if (strcmp(name, "vest") == 0) {
+            has_vest = 1;
+        } else if (strcmp(name, "no-vest") == 0) {
+            has_no_vest = 1;
+        } else if (strcmp(name, "person") == 0) {
+            has_person = 1;
+            if (danger_zone.valid &&
+                safety_box_center_in_zone(&snapshot.boxes[i], &danger_zone) &&
+                !safety_box_center_in_zone(&snapshot.boxes[i], &work_zone)) {
+                has_intrusion = 1;
+            }
+        } else if (strcmp(name, "fire") == 0) {
+            has_fire = 1;
+            if (work_zone.valid) {
+                if (safety_box_center_in_zone(&snapshot.boxes[i], &work_zone)) {
+                    has_fire_in_work_zone = 1;
+                } else {
+                    has_fire_out_of_work_zone = 1;
+                }
+            }
+        }
+    }
+
+    if (has_person) {
+        flags |= SAFETY_AI_FLAG_PERSON;
+    }
+    if (has_no_helmet) {
+        flags |= SAFETY_AI_FLAG_NO_HELMET;
+    }
+    if (has_no_vest) {
+        flags |= SAFETY_AI_FLAG_NO_VEST;
+    }
+    if (has_fire && !work_zone.valid) {
+        /* 未配置工作区时保持旧逻辑：bit4 作为通用 fire_detected。 */
+        flags |= SAFETY_AI_FLAG_FIRE;
+    } else {
+        if (has_fire_in_work_zone) {
+            flags |= SAFETY_AI_FLAG_FIRE;
+        }
+        if (has_fire_out_of_work_zone) {
+            flags |= SAFETY_AI_FLAG_FIRE_OUT;
+        }
+    }
+    if (has_intrusion) {
+        flags |= SAFETY_AI_FLAG_INTRUSION;
+    }
+    if ((has_helmet || !has_person) && has_vest && !has_no_helmet && !has_no_vest) {
+        flags |= SAFETY_AI_FLAG_PPE_OK;
+    }
+
+    *ai_flags_out = flags;
+    *ai_confidence_out = confidence;
+}
+
+static void safety_evaluate_fusion(uint16_t ai_flags,
+                                   const SafetyStm32Snapshot *stm32,
+                                   uint8_t *permit_decision,
+                                   uint8_t *risk_level,
+                                   uint8_t *risk_type,
+                                   uint8_t *voice_action,
+                                   uint8_t *stm32_action,
+                                   uint8_t *explain_code) {
+    int smoke_high = env_to_positive_int(SAFETY_SMOKE_HIGH_ENV, SAFETY_SMOKE_HIGH_DEFAULT);
+    int gas_high = env_to_positive_int(SAFETY_GAS_HIGH_ENV, SAFETY_GAS_HIGH_DEFAULT);
+    int temp_high_x10 = env_to_positive_int(SAFETY_TEMP_HIGH_X10_ENV, SAFETY_TEMP_HIGH_X10_DEFAULT);
+
+    *permit_decision = SAFETY_PERMIT_DENY;
+    *risk_level = SAFETY_RISK_WARNING;
+    *risk_type = SAFETY_RISK_TYPE_NONE;
+    *voice_action = SAFETY_VOICE_NONE;
+    *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+    *explain_code = 0;
+
+    if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
+        *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
+        *voice_action = SAFETY_VOICE_LINK_WARNING;
+        *explain_code = 81;
+        return;
+    }
+
+    if (stm32 == NULL || !stm32->online) {
+        *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
+        *voice_action = SAFETY_VOICE_LINK_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+        *explain_code = 81;
+        return;
+    }
+
+    if (stm32->fault_code != 0) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_STM32_FAULT;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_ALARM;
+        *explain_code = 82;
+        return;
+    }
+
+    if (stm32 != NULL && stm32->online) {
+        if (stm32->smoke >= (uint16_t)smoke_high) {
+            *risk_level = SAFETY_RISK_CRITICAL;
+            *risk_type = SAFETY_RISK_TYPE_ENV;
+            *voice_action = SAFETY_VOICE_ENV_WARNING;
+            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+            *explain_code = 61;
+            return;
+        }
+        if (stm32->gas >= (uint16_t)gas_high) {
+            *risk_level = SAFETY_RISK_CRITICAL;
+            *risk_type = SAFETY_RISK_TYPE_ENV;
+            *voice_action = SAFETY_VOICE_ENV_WARNING;
+            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+            *explain_code = 62;
+            return;
+        }
+        if (stm32->temperature_x10 >= temp_high_x10) {
+            *risk_level = SAFETY_RISK_CRITICAL;
+            *risk_type = SAFETY_RISK_TYPE_ENV;
+            *voice_action = SAFETY_VOICE_ENV_WARNING;
+            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+            *explain_code = 63;
+            return;
+        }
+    }
+
+    if (ai_flags & SAFETY_AI_FLAG_INTRUSION) {
+        *risk_level = SAFETY_RISK_DANGER;
+        *risk_type = SAFETY_RISK_TYPE_INTRUSION;
+        *voice_action = SAFETY_VOICE_INTRUSION_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_ALARM;
+        *explain_code = 51;
+        return;
+    }
+
+    if (ai_flags & SAFETY_AI_FLAG_FIRE_OUT) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_FIRE;
+        *voice_action = SAFETY_VOICE_FIRE_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+        *explain_code = 42;
+        return;
+    }
+
+    if (ai_flags & SAFETY_AI_FLAG_FIRE) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_FIRE;
+        *voice_action = SAFETY_VOICE_FIRE_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+        *explain_code = 41;
+        return;
+    }
+
+    if (ai_flags & SAFETY_AI_FLAG_NO_HELMET) {
+        *risk_type = SAFETY_RISK_TYPE_PPE;
+        *voice_action = SAFETY_VOICE_PPE_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+        *explain_code = 21;
+        return;
+    }
+
+    if (ai_flags & SAFETY_AI_FLAG_NO_VEST) {
+        *risk_type = SAFETY_RISK_TYPE_PPE;
+        *voice_action = SAFETY_VOICE_PPE_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+        *explain_code = 22;
+        return;
+    }
+
+    if (ai_flags & SAFETY_AI_FLAG_PPE_OK) {
+        *permit_decision = SAFETY_PERMIT_ALLOW;
+        *risk_level = SAFETY_RISK_SAFE;
+        *risk_type = SAFETY_RISK_TYPE_NONE;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *explain_code = 11;
+        return;
+    }
+
+    *risk_type = SAFETY_RISK_TYPE_PPE;
+    *voice_action = SAFETY_VOICE_PPE_WARNING;
+    *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+    *explain_code = 23;
+}
+
+static int safety_work_zone_configured(void) {
+    const char *value = getenv(SAFETY_WORK_ZONE_ENV);
+    return value != NULL && value[0] != '\0';
+}
+
+static void safety_audio_update_from_fusion(const SafetyRuntimeState *state,
+                                            int64_t frame_wall_ms) {
+    int command = 0;
+
+    if (state == NULL || state->voice_action == SAFETY_VOICE_NONE) {
+        return;
+    }
+
+    if (state->risk_type == SAFETY_RISK_TYPE_FIRE) {
+        if (state->explain_code == 42 || !safety_work_zone_configured()) {
+            command = 1;
+        }
+    } else if (state->risk_type == SAFETY_RISK_TYPE_INTRUSION) {
+        command = 4;
+    } else if (state->risk_type == SAFETY_RISK_TYPE_PPE) {
+        if (state->explain_code == 22) {
+            command = 2;
+        } else if (state->explain_code == 21) {
+            command = 3;
+        }
+    }
+
+    audio_alert_send_command(command, frame_wall_ms);
+}
+
+static void safety_runtime_update(SafetyInterlockClient *client,
+                                  SafetyRuntimeState *state,
+                                  DetectSharedState *detect_state,
+                                  int64_t frame_wall_ms,
+                                  int64_t frame_mono_ms) {
+    SafetyStm32Snapshot stm32_snapshot;
+    int ai_changed;
+    int fusion_changed;
+
+    if (client == NULL || state == NULL) {
+        return;
+    }
+
+    safety_build_ai_status(detect_state,
+                           frame_wall_ms,
+                           &state->ai_flags,
+                           &state->ai_confidence);
+    safety_client_get_snapshot(client, &stm32_snapshot);
+    safety_evaluate_fusion(state->ai_flags,
+                           &stm32_snapshot,
+                           &state->permit_decision,
+                           &state->risk_level,
+                           &state->risk_type,
+                           &state->voice_action,
+                           &state->stm32_action,
+                           &state->explain_code);
+    safety_audio_update_from_fusion(state, frame_wall_ms);
+
+    ai_changed = !state->initialized ||
+                 state->ai_flags != state->last_ai_flags ||
+                 state->ai_confidence != state->last_ai_confidence;
+    fusion_changed = !state->initialized ||
+                     state->permit_decision != state->last_permit_decision ||
+                     state->risk_level != state->last_risk_level ||
+                     state->risk_type != state->last_risk_type ||
+                     state->voice_action != state->last_voice_action ||
+                     state->stm32_action != state->last_stm32_action ||
+                     state->explain_code != state->last_explain_code;
+
+    if (ai_changed ||
+        state->last_ai_send_ms == 0 ||
+        frame_mono_ms - state->last_ai_send_ms >= SAFETY_AI_SEND_INTERVAL_MS) {
+        if (safety_client_send_ai_status(client, state->ai_flags, state->ai_confidence) == 0) {
+            state->last_ai_flags = state->ai_flags;
+            state->last_ai_confidence = state->ai_confidence;
+            state->last_ai_send_ms = frame_mono_ms;
+        }
+    }
+
+    if (fusion_changed ||
+        state->last_fusion_send_ms == 0 ||
+        frame_mono_ms - state->last_fusion_send_ms >= SAFETY_FUSION_SEND_INTERVAL_MS) {
+        if (safety_client_send_fusion_decision(client,
+                                               state->permit_decision,
+                                               state->risk_level,
+                                               state->risk_type,
+                                               state->voice_action,
+                                               state->stm32_action,
+                                               state->explain_code) == 0) {
+            state->last_permit_decision = state->permit_decision;
+            state->last_risk_level = state->risk_level;
+            state->last_risk_type = state->risk_type;
+            state->last_voice_action = state->voice_action;
+            state->last_stm32_action = state->stm32_action;
+            state->last_explain_code = state->explain_code;
+            state->last_fusion_send_ms = frame_mono_ms;
+        }
+    }
+
+    state->initialized = 1;
 }
 
 static int alarm_fusion_read_sensor_alarm(void) {
@@ -1191,6 +1637,7 @@ int main(void) {
     AiPipeline ai_pipeline;
     AlarmFusion alarm_fusion;
     SafetyInterlockClient safety_client;
+    SafetyRuntimeState safety_runtime;
     int safety_client_started = 0;
     int video_uploader_started = 0;
     char video_uploader_reason[256];
@@ -1204,6 +1651,7 @@ int main(void) {
     memset(&ai_pipeline, 0, sizeof(ai_pipeline));
     memset(&alarm_fusion, 0, sizeof(alarm_fusion));
     memset(&safety_client, 0, sizeof(safety_client));
+    memset(&safety_runtime, 0, sizeof(safety_runtime));
 
     install_signal_handlers();
 
@@ -1382,7 +1830,13 @@ int main(void) {
         ai_pipeline_process_frame(&ai_pipeline, current_dma_fd, frame_wall_ms);
         ai_pipeline_log_stats(&ai_pipeline, frame_mono_ms);
         alarm_fusion_update(&alarm_fusion, detect_state, frame_wall_ms);
-        audio_alert_update(detect_state, frame_wall_ms);
+        if (safety_client_started) {
+            safety_runtime_update(&safety_client,
+                                  &safety_runtime,
+                                  detect_state,
+                                  frame_wall_ms,
+                                  frame_mono_ms);
+        }
 
         if (last_video_stats_ms == 0) {
             last_video_stats_ms = frame_mono_ms;

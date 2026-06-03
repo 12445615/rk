@@ -8,22 +8,22 @@
 extern "C" {
 #endif
 
-// ¶¨ÒåÒ»¸ö¡°Ó¡ÕÂ¡±
+// ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ó¡ï¿½Â¡ï¿½
 typedef struct {
-    unsigned char* rgba_data; // ´æ·ÅÏñËØµÄÐéÄâÄÚ´æµØÖ·
-    rga_buffer_t rga_buf;     // RGA ÄÜ¿´¶®µÄ Buffer ½á¹¹
-    int width;                // Õâ¸öÓ¡ÕÂµÄ¿í¶È
-    int height;               // Õâ¸öÓ¡ÕÂµÄ¸ß¶È
+    unsigned char* rgba_data; // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Øµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú´ï¿½ï¿½Ö·
+    rga_buffer_t rga_buf;     // RGA ï¿½Ü¿ï¿½ï¿½ï¿½ï¿½ï¿½ Buffer ï¿½á¹¹
+    int width;                // ï¿½ï¿½ï¿½Ó¡ï¿½ÂµÄ¿ï¿½ï¿½ï¿½
+    int height;               // ï¿½ï¿½ï¿½Ó¡ï¿½ÂµÄ¸ß¶ï¿½
 } GlyphStamp;
 
-// È«¾ÖÓ¡ÕÂ²Ö¿â
-extern GlyphStamp g_stamp_labels[5]; // ´æ 5 ¸ö·ÖÀà±êÇ©
-extern GlyphStamp g_stamp_digits[10]; // ´æ '0' µ½ '9'
-extern GlyphStamp g_stamp_percent;    // ´æ '%'
+// È«ï¿½ï¿½Ó¡ï¿½Â²Ö¿ï¿½
+extern GlyphStamp g_stamp_labels[6]; // ï¿½ï¿½ 5 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç©
+extern GlyphStamp g_stamp_digits[10]; // ï¿½ï¿½ '0' ï¿½ï¿½ '9'
+extern GlyphStamp g_stamp_percent;    // ï¿½ï¿½ '%'
 
-// ³õÊ¼»¯º¯Êý£¨¿ª»úµ÷Ò»´Î£©
+// ï¿½ï¿½Ê¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½Î£ï¿½
 int osd_cache_init(const char* font_path, int font_size);
-// Ïú»Ùº¯Êý£¨¹Ø»úµ÷Ò»´Î£©
+// ï¿½ï¿½ï¿½Ùºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø»ï¿½ï¿½ï¿½Ò»ï¿½Î£ï¿½
 void osd_cache_deinit(void);
 
 #ifdef __cplusplus

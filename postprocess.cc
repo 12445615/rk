@@ -177,20 +177,9 @@ int post_process(rknn_output *outputs, rknn_tensor_attr *out_attr, int num_outpu
         }
     }
 
-    static int debug_no_candidate_logs = 0;
-    if (temp_results.empty() && debug_no_candidate_logs < 20) {
-        const char *name = (debug_best_class >= 0 && debug_best_class < OBJ_CLASS_NUM)
-                               ? project_labels[debug_best_class]
-                               : "unknown";
-        fprintf(stderr,
-                "[AI] no candidates: max_prob=%.6f class=%d(%s) anchor=%d threshold=%.3f\n",
-                debug_best_prob,
-                debug_best_class,
-                name,
-                debug_best_anchor,
-                conf_threshold);
-        debug_no_candidate_logs++;
-    }
+    (void)debug_best_prob;
+    (void)debug_best_class;
+    (void)debug_best_anchor;
 
     // 4. 排序与 NMS
     std::sort(temp_results.begin(), temp_results.end(), [](const object_detect_result &a, const object_detect_result &b) {

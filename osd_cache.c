@@ -14,11 +14,30 @@ const char* project_labels[6] = {
 GlyphStamp g_stamp_labels[6];
 GlyphStamp g_stamp_digits[10];
 GlyphStamp g_stamp_percent;
+GlyphStamp g_stamp_score_digits[6][10];
+GlyphStamp g_stamp_score_percent[6];
+GlyphStamp g_stamp_score_text[6][100];
 
 static FT_Library ft_lib = NULL;
 static FT_Face ft_face = NULL;
 
-static int create_stamp(const char* text, GlyphStamp* stamp) {
+static const unsigned int g_class_colors[6] = {
+    0x2ecc71, // helmet: green
+    0xff2d55, // no-helmet: red
+    0xff9500, // no-vest: orange
+    0x007aff, // person: blue
+    0x00a6d6, // vest: blue cyan
+    0xaf52de  // fire: purple
+};
+
+unsigned int osd_class_color_rgb(int class_id) {
+    if (class_id >= 0 && class_id < 6) {
+        return g_class_colors[class_id];
+    }
+    return 0xffffff;
+}
+
+static int create_stamp_colored(const char* text, GlyphStamp* stamp, unsigned int color) {
     if (!ft_face) return -1;
 
     // 1. �����ı�����
@@ -64,13 +83,13 @@ static int create_stamp(const char* text, GlyphStamp* stamp) {
                 int img_x = x_offset + c;
                 if (img_x >= 0 && img_x < stamp->width && img_y >= 0 && img_y < stamp->height) {
                     unsigned char alpha = bitmap->buffer[r * bitmap->pitch + c];
-                    if (alpha > 0) {
+                    if (alpha >= 96) {
                         // �������޸���������ʹ�� stride ���������������� width
                         int index = (img_y * stride + img_x) * 4;
-                        stamp->rgba_data[index + 0] = 0;   // R
-                        stamp->rgba_data[index + 1] = 255; // G
-                        stamp->rgba_data[index + 2] = 0;   // B
-                        stamp->rgba_data[index + 3] = alpha; // Alpha
+                        stamp->rgba_data[index + 0] = (color >> 16) & 0xff; // R
+                        stamp->rgba_data[index + 1] = (color >> 8) & 0xff;  // G
+                        stamp->rgba_data[index + 2] = color & 0xff;         // B
+                        stamp->rgba_data[index + 3] = 255; // Alpha
                     }
                 }
             }
@@ -91,12 +110,16 @@ static int create_stamp(const char* text, GlyphStamp* stamp) {
     return 0;
 }
 
+static int create_stamp(const char* text, GlyphStamp* stamp) {
+    return create_stamp_colored(text, stamp, 0x00ff00);
+}
+
 int osd_cache_init(const char* font_path, int font_size) {
     if (FT_Init_FreeType(&ft_lib)) return -1;
     if (FT_New_Face(ft_lib, font_path, 0, &ft_face)) return -1;
     FT_Set_Pixel_Sizes(ft_face, 0, font_size);
 
-    for (int i = 0; i < 6; i++) create_stamp(project_labels[i], &g_stamp_labels[i]);
+    for (int i = 0; i < 6; i++) create_stamp_colored(project_labels[i], &g_stamp_labels[i], 0xffffff);
     
     char digit_str[2] = {0};
     for (int i = 0; i < 10; i++) {
@@ -104,6 +127,22 @@ int osd_cache_init(const char* font_path, int font_size) {
         create_stamp(digit_str, &g_stamp_digits[i]);
     }
     create_stamp("%", &g_stamp_percent);
+
+    for (int cls = 0; cls < 6; cls++) {
+        unsigned int color = 0xffffff;
+        for (int i = 0; i < 10; i++) {
+            digit_str[0] = '0' + i;
+            create_stamp_colored(digit_str, &g_stamp_score_digits[cls][i], color);
+        }
+        create_stamp_colored("%", &g_stamp_score_percent[cls], color);
+
+        char score_str[4];
+        for (int score = 0; score < 100; score++) {
+            snprintf(score_str, sizeof(score_str), "%02d%%", score);
+            create_stamp_colored(score_str, &g_stamp_score_text[cls][score], color);
+        }
+    }
+
     return 0;
 }
 
@@ -111,6 +150,15 @@ void osd_cache_deinit(void) {
     for (int i = 0; i < 6; i++) { if(g_stamp_labels[i].rgba_data) free(g_stamp_labels[i].rgba_data); }
     for (int i = 0; i < 10; i++) { if(g_stamp_digits[i].rgba_data) free(g_stamp_digits[i].rgba_data); }
     if(g_stamp_percent.rgba_data) free(g_stamp_percent.rgba_data);
+    for (int cls = 0; cls < 6; cls++) {
+        for (int i = 0; i < 10; i++) {
+            if (g_stamp_score_digits[cls][i].rgba_data) free(g_stamp_score_digits[cls][i].rgba_data);
+        }
+        if (g_stamp_score_percent[cls].rgba_data) free(g_stamp_score_percent[cls].rgba_data);
+        for (int score = 0; score < 100; score++) {
+            if (g_stamp_score_text[cls][score].rgba_data) free(g_stamp_score_text[cls][score].rgba_data);
+        }
+    }
     FT_Done_Face(ft_face);
     FT_Done_FreeType(ft_lib);
 }

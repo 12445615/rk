@@ -50,7 +50,7 @@
 #define STREAM_RESTART_BASE_MS 1000
 #define STREAM_RESTART_MAX_MS 30000
 #define STREAM_FPS_ENV "CAMERA_FLOW_STREAM_FPS"
-#define STREAM_FPS_DEFAULT 15
+#define STREAM_FPS_DEFAULT 30
 #define STREAM_DUP_FRAMES_ENV "CAMERA_FLOW_DUP_FRAMES"
 #define STREAM_DUP_FRAMES_DEFAULT 1
 #define CHILD_RTMP_RETRY_BASE_MS 1000
@@ -343,7 +343,6 @@ static int ai_preprocess_dma_to_rgb_fd(int dma_fd,
                                        const RknnWorkerInputBuffer *input_buffer) {
     rga_buffer_t src;
     rga_buffer_t dst;
-    im_rect fill_rect;
     im_rect src_rect;
     im_rect dst_rect;
     IM_STATUS status;
@@ -384,10 +383,8 @@ static int ai_preprocess_dma_to_rgb_fd(int dma_fd,
     dst.wstride = (int)dst_width;
     dst.hstride = (int)dst_height;
 
-    fill_rect = (im_rect){0, 0, (int)dst_width, (int)dst_height};
-    status = imfill_t(dst, fill_rect, 0x727272, IM_SYNC);
-    if (status != IM_STATUS_SUCCESS) {
-        return -1;
+    if (input_buffer->virt_addr != NULL && input_buffer->size > 0) {
+        memset(input_buffer->virt_addr, 0x72, input_buffer->size);
     }
 
     src_rect = (im_rect){0, 0, WIDTH, HEIGHT};
@@ -397,15 +394,21 @@ static int ai_preprocess_dma_to_rgb_fd(int dma_fd,
 
     status = improcess(src, dst, (rga_buffer_t){0},
                        src_rect, dst_rect, (im_rect){0}, IM_SYNC);
-    // 【加入这段极其关键的报错打印】
     if (status != IM_STATUS_SUCCESS) {
-        printf("\n======================================================\n");
-        printf("🚨 [RGA 致命报错] 图像转换失败!\n");
-        printf("🚨 错误码: %d\n", status);
-        printf("🚨 错误详情: %s\n", imStrError((IM_STATUS)status));
-        printf("🚨 SRC (相机): 宽=%d, 高=%d, 格式=%d\n", src.width, src.height, src.format);
-        printf("🚨 DST (NPU): 宽=%d, 高=%d, 格式=%d\n", dst.width, dst.height, dst.format);
-        printf("======================================================\n\n");
+        static int rga_error_logs = 0;
+        if (rga_error_logs < 3) {
+            fprintf(stderr,
+                    "[AI][RGA] preprocess failed: status=%d detail=%s src=%dx%d fmt=%d dst=%dx%d fmt=%d\n",
+                    status,
+                    imStrError((IM_STATUS)status),
+                    src.width,
+                    src.height,
+                    src.format,
+                    dst.width,
+                    dst.height,
+                    dst.format);
+            rga_error_logs++;
+        }
         return -1;
     }
 

@@ -132,23 +132,26 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     // ========================================================
     // ����ˢ���Ż���ʼ��
     // 1. �޸� GOP ��СΪ 60��Լ����һ��I֡��������Ƶ���Ĵ��ˢ�µ��µĿ���
-    s->enc_ctx->gop_size = fps; 
+    s->enc_ctx->gop_size = fps / 2;
+    if (s->enc_ctx->gop_size < 1) {
+        s->enc_ctx->gop_size = 1;
+    }
     
     s->enc_ctx->max_b_frames = 0;
     s->enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
     
    // 1. �������������� 3Mbps����֤�ճ�������
-    s->enc_ctx->bit_rate = 2000000; 
+    s->enc_ctx->bit_rate = 3000000; 
     
     // 2. �����ġ�������ʷſ��� 6Mbps������������ͷ�����ƶ�ʱ����������������͸��̬���棡
-    s->enc_ctx->rc_max_rate = 2000000; 
-    s->enc_ctx->rc_buffer_size = 300000;
+    s->enc_ctx->rc_max_rate = 3000000; 
+    s->enc_ctx->rc_buffer_size = 200000;
 
     // 3. �����ġ��ſ����ѹ���� (qmax)
     // qmin ���� 18����֤��ֹ���漫��������
     // qmax �������ߵ� 45���������̫�ͱ���32�������˶�ʱ���ʻᳬ�꣬Ӳ�������ֱ�ӱ������������ߺ�����Ǳ���ͣ���������˺�ѣ�
     s->enc_ctx->qmin = 18;
-    s->enc_ctx->qmax = 45;
+    s->enc_ctx->qmax = 38;
     s->video_st->time_base = s->enc_ctx->time_base;
     // ========================================================
 
@@ -361,6 +364,85 @@ static int align_even_down(int value) { return value & ~1; }
 
 static int align_even_up(int value) { return (value + 1) & ~1; }
 
+static void nv12_fill_rect(FFmpegStreamer *s,
+                           int x,
+                           int y,
+                           int width,
+                           int height,
+                           unsigned char y_value,
+                           unsigned char uv_value) {
+    int row;
+    int uv_row;
+    int uv_x;
+    int uv_y;
+    int uv_w;
+    int uv_h;
+    unsigned char *y_plane;
+    unsigned char *uv_plane;
+
+    if (s == NULL || s->yuv_frame == NULL || s->yuv_frame->data[0] == NULL ||
+        width <= 0 || height <= 0) {
+        return;
+    }
+
+    x = clamp_int(x, 0, s->width);
+    y = clamp_int(y, 0, s->height);
+    width = clamp_int(width, 0, s->width - x);
+    height = clamp_int(height, 0, s->height - y);
+    if (width <= 0 || height <= 0) return;
+
+    y_plane = s->yuv_frame->data[0];
+    for (row = 0; row < height; row++) {
+        memset(y_plane + (y + row) * s->yuv_frame->linesize[0] + x, y_value, width);
+    }
+
+    uv_plane = s->yuv_frame->data[0] + s->yuv_frame->linesize[0] * 768;
+    uv_x = x & ~1;
+    uv_y = y & ~1;
+    uv_w = align_even_up(width + (x - uv_x));
+    uv_h = align_even_up(height + (y - uv_y)) / 2;
+    uv_w = clamp_int(uv_w, 0, s->width - uv_x);
+    if (uv_w <= 0 || uv_h <= 0) return;
+
+    for (uv_row = 0; uv_row < uv_h; uv_row++) {
+        memset(uv_plane + (uv_y / 2 + uv_row) * s->yuv_frame->linesize[1] + uv_x,
+               uv_value,
+               uv_w);
+    }
+}
+
+static void nv12_draw_stamp_luma(FFmpegStreamer *s,
+                                 const GlyphStamp *stamp,
+                                 int x,
+                                 int y,
+                                 unsigned char y_value) {
+    int stride;
+    int row;
+    int col;
+    unsigned char *y_plane;
+
+    if (s == NULL || stamp == NULL || stamp->rgba_data == NULL ||
+        s->yuv_frame == NULL || s->yuv_frame->data[0] == NULL) {
+        return;
+    }
+
+    stride = (stamp->width + 3) & ~3;
+    y_plane = s->yuv_frame->data[0];
+    for (row = 0; row < stamp->height; row++) {
+        int dst_y = y + row;
+        if (dst_y < 0 || dst_y >= s->height) continue;
+        for (col = 0; col < stamp->width; col++) {
+            int dst_x = x + col;
+            int src_index;
+            if (dst_x < 0 || dst_x >= s->width) continue;
+            src_index = (row * stride + col) * 4;
+            if (stamp->rgba_data[src_index + 3] != 0) {
+                y_plane[dst_y * s->yuv_frame->linesize[0] + dst_x] = y_value;
+            }
+        }
+    }
+}
+
 typedef struct {
     int valid;
     int x1;
@@ -510,6 +592,8 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
         int height = y2 - y1;
 
         int border = 4;
+        int class_id = detect_state->boxes[i].class_id;
+        unsigned int box_color = osd_class_color_rgb(class_id);
 
         im_rect rects[4];
 
@@ -555,7 +639,7 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
 
         for (edge = 0; edge < 4; edge++) {
 
-            status = imfill_t(dst, rects[edge], 0x00ff00, IM_SYNC);
+            status = imfill_t(dst, rects[edge], box_color, IM_SYNC);
 
             if (status != IM_STATUS_SUCCESS) return;
 
@@ -579,7 +663,6 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
     rga_buffer_t src, dst;
 
-    IM_STATUS status;
     int64_t push_start_ms;
     int64_t push_end_ms;
     static int64_t stat_start_ms = 0;
@@ -620,9 +703,10 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
 
 
-    status = improcess(src, dst, (rga_buffer_t){0}, (im_rect){0, 0, s->width, s->height}, 
-
-                       (im_rect){0, 0, s->width, s->height}, (im_rect){0}, IM_SYNC);
+    if (improcess(src, dst, (rga_buffer_t){0}, (im_rect){0, 0, s->width, s->height},
+                  (im_rect){0, 0, s->width, s->height}, (im_rect){0}, IM_SYNC) != IM_STATUS_SUCCESS) {
+        return -1;
+    }
 
     
 
@@ -664,25 +748,46 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
             if (start_y < 20) start_y = ((int)local.boxes[i].y2 + 5) & ~1;
 
-            int current_x = start_x;
+            int current_x = start_x + 8;
+            int score_int = (int)(display_score * 100.0f);
+            if (score_int > 99) score_int = 99;
+            if (score_int < 0) score_int = 0;
+            GlyphStamp *label = &g_stamp_labels[id];
+            GlyphStamp *score = &g_stamp_score_text[id][score_int];
+            int label_w = label->rgba_data ? ALIGN_TO_2(label->width) : 0;
+            int label_h = label->rgba_data ? ALIGN_TO_2(label->height) : 0;
+            int score_w = score->rgba_data ? ALIGN_TO_2(score->width) : 0;
+            int score_h = score->rgba_data ? ALIGN_TO_2(score->height) : 0;
+            int text_h = label_h;
+            if (score_h > text_h) text_h = score_h;
+            int text_w = label_w + (label_w > 0 && score_w > 0 ? 5 : 0) + score_w;
+            int bg_x = clamp_int(start_x - 3, 0, s->width - 2);
+            int bg_y = clamp_int(start_y - 3, 0, s->height - 2);
+            int bg_w = clamp_int(text_w + 8, 2, s->width - bg_x);
+            int bg_h = clamp_int(text_h + 6, 2, s->height - bg_y);
+
+            bg_x = align_even_down(bg_x);
+            bg_y = align_even_down(bg_y);
+            bg_w = align_even_up(bg_w);
+            bg_h = align_even_up(bg_h);
+            if (bg_x + bg_w > s->width) bg_w = align_even_down(s->width - bg_x);
+            if (bg_y + bg_h > s->height) bg_h = align_even_down(s->height - bg_y);
+            if (bg_w > 0 && bg_h > 0) {
+                nv12_fill_rect(s, bg_x, bg_y, bg_w, bg_h, 16, 128);
+                if (bg_w >= 8) {
+                    imfill_t(dst, (im_rect){bg_x, bg_y, 6, bg_h}, osd_class_color_rgb(id), IM_SYNC);
+                }
+            }
 
 
 
             // A. �Ƿ����ǩ
 
-            GlyphStamp *label = &g_stamp_labels[id];
-
             if (label->rgba_data) {
 
-                int w = ALIGN_TO_2(label->width);
+                nv12_draw_stamp_luma(s, label, current_x, start_y, 235);
 
-                int h = ALIGN_TO_2(label->height);
-
-                improcess(label->rga_buf, dst, (rga_buffer_t){0}, (im_rect){0, 0, label->width, label->height}, 
-
-                          (im_rect){current_x, start_y, w, h}, (im_rect){0}, IM_ALPHA_BLEND_SRC_OVER | IM_SYNC);
-
-                current_x += (w + 4);
+                current_x += (label_w + 4);
 
             }
 
@@ -690,46 +795,9 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
             // B. �����Ŷ� (ʹ��ƽ�������ֵ)
 
-            int score_int = (int)(display_score * 100.0f);
+            if (score->rgba_data) {
 
-            if (score_int > 99) score_int = 99;
-
-            int tens = score_int / 10;
-
-            int ones = score_int % 10;
-
-
-
-            GlyphStamp *digits[3] = { &g_stamp_digits[tens], &g_stamp_digits[ones], &g_stamp_percent };
-
-            
-
-            for(int k = 0; k < 3; k++) {
-
-                int w = ALIGN_TO_2(digits[k]->width);
-
-                int h = ALIGN_TO_2(digits[k]->height);
-
-                status = improcess(digits[k]->rga_buf, dst, (rga_buffer_t){0}, 
-
-                          (im_rect){0, 0, digits[k]->width, digits[k]->height}, 
-
-                          (im_rect){current_x, start_y, w, h}, 
-
-                          (im_rect){0}, IM_ALPHA_BLEND_SRC_OVER | IM_SYNC);
-
-                
-
-                // ֻ��������������ӡ�����û�������˵������û��ѭ��
-
-                if (status != IM_STATUS_SUCCESS) {
-
-                    printf("DEBUG: Failed to draw digit k=%d, w=%d, h=%d\n", k, w, h);
-
-                }
-
-                current_x += (w + 2);
-
+                nv12_draw_stamp_luma(s, score, current_x, start_y, 235);
             }
 
         }

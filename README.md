@@ -41,27 +41,36 @@ bps [2812500:3000000:3187500]
 摄像头实际帧率、编码器 fps、RTMP 推流节奏要保持一致。
 ```
 
-## 本分支说明：STM32 串口通信底座
+## RK3588 安全联锁集成状态
 
-当前分支新增 RK3588 与 STM32 安全下位机的串口通信底座，目标是先跑通双方通信，不改变现有 AI 识别、视频采集、RTMP 推流、MQTT 上报、音频报警和视频落盘逻辑。
+当前分支已经完成 RK3588 侧的 STM32 串口通信底座、6 类 YOLO/RKNN 识别适配、AI 状态发送、规则版融合决策、电子围栏、语音报警、OSD 显示优化和 RTMP 推流优化。
 
-本分支新增内容：
+已完成内容：
 
-- 新增 `safety_interlock_client.c/.h`
+- 新增并接入 `safety_interlock_client.c/.h`
 - 默认使用 `/dev/ttyS9` 与 STM32 通信
 - 串口参数为 `115200 8N1`
 - RK3588 每 `500ms` 发送一次二进制心跳帧
 - 支持统一帧格式：`A5 5A | VERSION | TYPE | SEQ | LEN | PAYLOAD | CRC16 | 0D`
 - 支持接收 STM32 状态、传感器数据、执行器状态、联锁事件和故障事件
 - 收到 STM32 联锁事件后自动回复 `EVENT_ACK`
+- 已将 RKNN/YOLO 识别结果转换为 `AI_STATUS`
+- 已将规则版风险融合结果发送为 `FUSION_DECISION`
+- 已适配 6 类模型标签：`helmet`、`no-helmet`、`no-vest`、`person`、`vest`、`fire`
+- 已接入工作区/危险区电子围栏，支持 `SAFETY_WORK_ZONE` 和 `SAFETY_DANGER_ZONE`
+- 已实现非工作区火光、危险区人员、未戴安全帽、未穿防护服/反光背心的语音报警触发
+- 已优化 OSD 标签、数字和字体显示清晰度
+- 已优化 RTMP 推流帧率、GOP、码率和低延迟参数
 - 旧的 Modbus 传感器线程默认跳过，避免继续占用或查找 `/dev/ttyUSB0`
 
-本分支暂未接入的内容：
+当前仍待完善的内容：
 
-- 尚未把现有 RKNN/YOLO 检测结果发送为 `AI_STATUS`
-- 尚未把风险融合结果发送为 `FUSION_DECISION`
-- 尚未把 STM32 上传的传感器数据写入原有 `g_sensor_data`
-- 尚未改动 RTMP 推流、AI 推理、MQTT、音频报警和视频补传逻辑
+- STM32 固件侧还需要完整解析 RK3588 下发的 `AI_STATUS` 和 `FUSION_DECISION`
+- STM32 侧还需要完成继电器、风机、报警、锁定、复位等安全状态机闭环
+- STM32 上传的 `SENSOR_DATA` 还需要进一步接入环境风险判断和云端展示
+- `safety_events` 安全事件 SQLite 表、事件证据包和处置验证流程仍待完善
+- 当前融合决策是规则版，环境时序随机森林和多模态融合模型仍属于后续增强项
+- Qt/云端展示还需要对齐作业许可、风险等级、STM32 状态、传感器曲线和安全事件字段
 
 如果后续需要重新启用旧 Modbus 传感器线程，可在运行前设置：
 

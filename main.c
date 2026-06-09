@@ -6,7 +6,6 @@
 #include "video_store.h"
 #include "video_uploader.h"
 #include "rknn_worker.h"
-#include "relay_alarm.h"
 #include "safety_interlock_client.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,10 +61,7 @@
 #define AI_NMS_ENV "CAMERA_FLOW_AI_NMS"
 #define AI_STATS_INTERVAL_MS 5000
 #define VIDEO_STATS_INTERVAL_MS 5000
-#define ALARM_FUSION_EVAL_MS 200
-#define ALARM_FUSION_ON_CONFIRM 3
-#define ALARM_FUSION_OFF_CONFIRM 5
-#define ALARM_FUSION_AI_STALE_MS 1500
+#define SAFETY_AI_STALE_MS 1500
 #define SAFETY_AI_SEND_INTERVAL_MS 500
 #define SAFETY_FUSION_SEND_INTERVAL_MS 500
 #define SAFETY_SMOKE_HIGH_ENV "SAFETY_SMOKE_HIGH"
@@ -73,6 +69,8 @@
 #define SAFETY_TEMP_HIGH_X10_ENV "SAFETY_TEMP_HIGH_X10"
 #define SAFETY_WORK_ZONE_ENV "SAFETY_WORK_ZONE"
 #define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
+#define SAFETY_WORK_ZONE_DEFAULT "520,220,880,560"
+#define SAFETY_DANGER_ZONE_DEFAULT "160,120,1040,640"
 #define SAFETY_SMOKE_HIGH_DEFAULT 600
 #define SAFETY_GAS_HIGH_DEFAULT 500
 #define SAFETY_TEMP_HIGH_X10_DEFAULT 600
@@ -84,6 +82,15 @@
 #define SAFETY_AI_FLAG_FIRE_OUT    (1u << 5)
 #define SAFETY_AI_FLAG_INTRUSION   (1u << 6)
 #define SAFETY_AI_FLAG_PERSON      (1u << 8)
+
+#define AI_DETECT_STATE_NONE 0
+#define AI_DETECT_STATE_PPE_OK 1
+#define AI_DETECT_STATE_NO_HELMET 2
+#define AI_DETECT_STATE_NO_VEST 3
+#define AI_DETECT_STATE_PPE_BOTH_BAD 4
+#define AI_DETECT_STATE_FIRE_WORK_ZONE 5
+#define AI_DETECT_STATE_FIRE_OUT_ZONE 6
+#define AI_DETECT_STATE_INTRUSION 7
 
 volatile sig_atomic_t is_running = 1;
 static volatile sig_atomic_t g_video_uploader_signal_ready = 0;
@@ -147,19 +154,6 @@ typedef struct {
     uint64_t skipped_interval_count;
     DetectSharedState *detect_state;
 } AiPipeline;
-
-typedef enum {
-    ALARM_FUSION_OFF = 0,
-    ALARM_FUSION_ON = 1
-} AlarmFusionState;
-
-typedef struct {
-    AlarmFusionState state;
-    int on_count;
-    int off_count;
-    int relay_level;
-    int64_t last_eval_ms;
-} AlarmFusion;
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -660,7 +654,13 @@ static int safety_parse_zone_rect(const char *env_name, SafetyZoneRect *rect) {
 
     value = getenv(env_name);
     if (value == NULL || value[0] == '\0') {
-        return 0;
+        if (strcmp(env_name, SAFETY_WORK_ZONE_ENV) == 0) {
+            value = SAFETY_WORK_ZONE_DEFAULT;
+        } else if (strcmp(env_name, SAFETY_DANGER_ZONE_ENV) == 0) {
+            value = SAFETY_DANGER_ZONE_DEFAULT;
+        } else {
+            return 0;
+        }
     }
 
     errno = 0;
@@ -728,7 +728,7 @@ static void safety_build_ai_status(DetectSharedState *shared,
 
     if (!detect_snapshot_read(shared, &snapshot) ||
         snapshot.timestamp_ms <= 0 ||
-        now_ms - snapshot.timestamp_ms > ALARM_FUSION_AI_STALE_MS) {
+        now_ms - snapshot.timestamp_ms > SAFETY_AI_STALE_MS) {
         *ai_flags_out = 0;
         *ai_confidence_out = 0;
         return;
@@ -820,18 +820,19 @@ static void safety_evaluate_fusion(uint16_t ai_flags,
     *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
     *explain_code = 0;
 
-    if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
+    if (stm32 == NULL || !stm32->online) {
         *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
-        *voice_action = SAFETY_VOICE_LINK_WARNING;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
         *explain_code = 81;
         return;
     }
 
-    if (stm32 == NULL || !stm32->online) {
-        *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
-        *voice_action = SAFETY_VOICE_LINK_WARNING;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
-        *explain_code = 81;
+    if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
+        *risk_type = SAFETY_RISK_TYPE_NONE;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *explain_code = 23;
         return;
     }
 
@@ -923,15 +924,56 @@ static void safety_evaluate_fusion(uint16_t ai_flags,
         return;
     }
 
+    if ((ai_flags & SAFETY_AI_FLAG_PERSON) == 0) {
+        *permit_decision = SAFETY_PERMIT_ALLOW;
+        *risk_level = SAFETY_RISK_SAFE;
+        *risk_type = SAFETY_RISK_TYPE_NONE;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *explain_code = 12;
+        return;
+    }
+
     *risk_type = SAFETY_RISK_TYPE_PPE;
     *voice_action = SAFETY_VOICE_PPE_WARNING;
     *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
     *explain_code = 23;
 }
 
+static uint8_t safety_ai_flags_to_detect_state(uint16_t ai_flags) {
+    int no_helmet = (ai_flags & SAFETY_AI_FLAG_NO_HELMET) != 0;
+    int no_vest = (ai_flags & SAFETY_AI_FLAG_NO_VEST) != 0;
+
+    if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
+        return AI_DETECT_STATE_NONE;
+    }
+    if (ai_flags & SAFETY_AI_FLAG_INTRUSION) {
+        return AI_DETECT_STATE_INTRUSION;
+    }
+    if (ai_flags & SAFETY_AI_FLAG_FIRE_OUT) {
+        return AI_DETECT_STATE_FIRE_OUT_ZONE;
+    }
+    if (ai_flags & SAFETY_AI_FLAG_FIRE) {
+        return AI_DETECT_STATE_FIRE_WORK_ZONE;
+    }
+    if (no_helmet && no_vest) {
+        return AI_DETECT_STATE_PPE_BOTH_BAD;
+    }
+    if (no_helmet) {
+        return AI_DETECT_STATE_NO_HELMET;
+    }
+    if (no_vest) {
+        return AI_DETECT_STATE_NO_VEST;
+    }
+    if (ai_flags & SAFETY_AI_FLAG_PPE_OK) {
+        return AI_DETECT_STATE_PPE_OK;
+    }
+    return AI_DETECT_STATE_NONE;
+}
+
 static int safety_work_zone_configured(void) {
     const char *value = getenv(SAFETY_WORK_ZONE_ENV);
-    return value != NULL && value[0] != '\0';
+    return (value != NULL && value[0] != '\0') || SAFETY_WORK_ZONE_DEFAULT[0] != '\0';
 }
 
 static void safety_audio_update_from_fusion(const SafetyRuntimeState *state,
@@ -985,6 +1027,10 @@ static void safety_runtime_update(SafetyInterlockClient *client,
                            &state->voice_action,
                            &state->stm32_action,
                            &state->explain_code);
+    safety_client_update_ai_detect_state(client,
+                                         safety_ai_flags_to_detect_state(state->ai_flags),
+                                         state->ai_confidence,
+                                         frame_wall_ms);
     safety_audio_update_from_fusion(state, frame_wall_ms);
 
     ai_changed = !state->initialized ||
@@ -1029,109 +1075,6 @@ static void safety_runtime_update(SafetyInterlockClient *client,
     }
 
     state->initialized = 1;
-}
-
-static int alarm_fusion_read_sensor_alarm(void) {
-    int alarm;
-
-    pthread_mutex_lock(&g_sensor_data.lock);
-    alarm = g_sensor_data.alarm_status != 0;
-    pthread_mutex_unlock(&g_sensor_data.lock);
-    return alarm;
-}
-
-static int alarm_fusion_read_ai_fire(DetectSharedState *shared, int64_t now_ms) {
-    DetectSharedState snapshot;
-
-    if (!detect_snapshot_read(shared, &snapshot)) {
-        return 0;
-    }
-    // 数据是否过期
-    if (snapshot.timestamp_ms <= 0 || now_ms - snapshot.timestamp_ms > ALARM_FUSION_AI_STALE_MS) {
-        return 0;
-    }
-    
-    // 🚨 遍历画面里的所有框，只寻找火灾目标
-    for (int i = 0; i < snapshot.box_count; i++) {
-        char *name = coco_cls_to_name(snapshot.boxes[i].class_id);
-        
-        // 只要画面里出现 fire，就返回 1 (代表有火)
-        if (strcmp(name, "fire") == 0) {
-            return 1; 
-        }
-    }
-    return 0; // 没火，不管有没有人穿反光衣都返回0
-}
-static void alarm_fusion_set_relay(AlarmFusion *fusion, int alarm_on) {
-    int rc;
-
-    if (fusion == NULL || fusion->relay_level == alarm_on) {
-        return;
-    }
-
-    rc = relay_alarm_set(alarm_on);
-    if (rc == 0) {
-        fusion->relay_level = alarm_on;
-        printf("[Parent][Alarm] relay %s\n", alarm_on ? "ON" : "OFF");
-    } else {
-        fprintf(stderr, "[Parent][Alarm] relay %s failed\n", alarm_on ? "ON" : "OFF");
-    }
-}
-
-static void alarm_fusion_update(AlarmFusion *fusion,
-                                DetectSharedState *detect_state,
-                                int64_t now_ms) {
-    int sensor_alarm;
-    int ai_fire_alarm;
-    int fused_alarm;
-
-    if (fusion == NULL) {
-        return;
-    }
-    if (fusion->last_eval_ms > 0 &&
-        now_ms - fusion->last_eval_ms < ALARM_FUSION_EVAL_MS) {
-        return;
-    }
-    fusion->last_eval_ms = now_ms;
-
-    // A. 读取传感器报警状态（来自你刚改好的 sensor_modbus.c，代表温度/烟雾是否骤升或超标）
-    sensor_alarm = alarm_fusion_read_sensor_alarm();
-    
-    // B. 读取 AI 检测是否发现火灾（忽略反光衣）
-    ai_fire_alarm = alarm_fusion_read_ai_fire(detect_state, now_ms);
-
-    // ===============================================
-    // C. 核心多模态融合逻辑：
-    //  - 仅当 AI 识别到火灾 AND 传感器确认（温度/烟雾骤升或超标）时，才触发继电器报警！
-    // ===============================================
-    fused_alarm = ai_fire_alarm && sensor_alarm;
-
-    // 下面的防抖逻辑（连续确认才触发继电器）保持不变
-    if (fusion->state == ALARM_FUSION_OFF) {
-        if (fused_alarm) {
-            fusion->on_count++;
-            fusion->off_count = 0;
-            if (fusion->on_count >= ALARM_FUSION_ON_CONFIRM) {
-                fusion->state = ALARM_FUSION_ON;
-                fusion->on_count = 0;
-                alarm_fusion_set_relay(fusion, 1);
-            }
-        } else {
-            fusion->on_count = 0;
-        }
-    } else {
-        if (fused_alarm) {
-            fusion->off_count = 0;
-        } else {
-            fusion->off_count++;
-            fusion->on_count = 0;
-            if (fusion->off_count >= ALARM_FUSION_OFF_CONFIRM) {
-                fusion->state = ALARM_FUSION_OFF;
-                fusion->off_count = 0;
-                alarm_fusion_set_relay(fusion, 0);
-            }
-        }
-    }
 }
 
 static int video_uploader_macro_ready(char *reason, size_t reason_size) {
@@ -1638,7 +1581,6 @@ int main(void) {
     int dma_fds[BUF_COUNT] = { -1, -1, -1, -1 };
     VideoUploader video_uploader;
     AiPipeline ai_pipeline;
-    AlarmFusion alarm_fusion;
     SafetyInterlockClient safety_client;
     SafetyRuntimeState safety_runtime;
     int safety_client_started = 0;
@@ -1652,7 +1594,6 @@ int main(void) {
 
     memset(&video_uploader, 0, sizeof(video_uploader));
     memset(&ai_pipeline, 0, sizeof(ai_pipeline));
-    memset(&alarm_fusion, 0, sizeof(alarm_fusion));
     memset(&safety_client, 0, sizeof(safety_client));
     memset(&safety_runtime, 0, sizeof(safety_runtime));
 
@@ -1756,6 +1697,9 @@ int main(void) {
     }
     audio_alert_init();//启动音频线程
     {
+        if (safety_client_started) {
+            set_mqtt_safety_client(&safety_client);
+        }
         int rc = start_mqtt_reporter();
         if (rc != 0) {
             fprintf(stderr, "[Parent] Failed to start MQTT reporter: %s\n", strerror(rc));
@@ -1832,7 +1776,6 @@ int main(void) {
 
         ai_pipeline_process_frame(&ai_pipeline, current_dma_fd, frame_wall_ms);
         ai_pipeline_log_stats(&ai_pipeline, frame_mono_ms);
-        alarm_fusion_update(&alarm_fusion, detect_state, frame_wall_ms);
         if (safety_client_started) {
             safety_runtime_update(&safety_client,
                                   &safety_runtime,
@@ -1889,7 +1832,6 @@ cleanup:
         video_uploader_stop(&video_uploader);
     }
     g_video_uploader_for_signal = NULL;
-    relay_alarm_off();
 
     camera_stop(&cam);
     camera_deinit(&cam);

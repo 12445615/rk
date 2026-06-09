@@ -4,6 +4,8 @@
 
 #include <stdlib.h>
 
+#include <string.h>
+
 #include <libavutil/hwcontext_drm.h>
 
 #include <drm/drm_fourcc.h>
@@ -29,6 +31,8 @@
 #define ALIGN_TO_2(x) ((x + 1) & ~1)
 #define SAFETY_WORK_ZONE_ENV "SAFETY_WORK_ZONE"
 #define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
+#define SAFETY_WORK_ZONE_DEFAULT "520,220,880,560"
+#define SAFETY_DANGER_ZONE_DEFAULT "160,120,1040,640"
 
 
 
@@ -468,7 +472,13 @@ static int parse_overlay_zone_rect(const char *env_name, OverlayZoneRect *rect) 
 
     value = getenv(env_name);
     if (value == NULL || value[0] == '\0') {
-        return 0;
+        if (strcmp(env_name, SAFETY_WORK_ZONE_ENV) == 0) {
+            value = SAFETY_WORK_ZONE_DEFAULT;
+        } else if (strcmp(env_name, SAFETY_DANGER_ZONE_ENV) == 0) {
+            value = SAFETY_DANGER_ZONE_DEFAULT;
+        } else {
+            return 0;
+        }
     }
 
     if (sscanf(value, " %f , %f , %f , %f %c", &x1, &y1, &x2, &y2, &tail) != 4) {
@@ -542,7 +552,7 @@ static void draw_safety_zones(FFmpegStreamer *s, rga_buffer_t dst) {
     parse_overlay_zone_rect(SAFETY_WORK_ZONE_ENV, &work_zone);
 
     draw_overlay_zone_rect(s, dst, &danger_zone, 6, 0xff0000);
-    draw_overlay_zone_rect(s, dst, &work_zone, 4, 0x00ff00);
+    draw_overlay_zone_rect(s, dst, &work_zone, 4, 0x0000ff);
 }
 
 

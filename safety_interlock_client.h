@@ -6,28 +6,48 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SAFETY_FRAME_HEAD1 0xA5
-#define SAFETY_FRAME_HEAD2 0x5A
-#define SAFETY_FRAME_VERSION 0x01
-#define SAFETY_FRAME_TAIL 0x0D
-#define SAFETY_PAYLOAD_MAX 255
+#define SAFETY_FRAME_HEAD 0xA5
+#define SAFETY_FRAME_TAIL 0x5A
+#define SAFETY_SENSOR_FRAME_CODE 0xB0
+#define SAFETY_ACTUATOR_FRAME_CODE 0xC0
 
 #define SAFETY_STM32_DEV_ENV "SAFETY_STM32_DEV"
 #define SAFETY_STM32_BAUD_ENV "SAFETY_STM32_BAUD"
 #define SAFETY_STM32_DEV_DEFAULT "/dev/ttyS9"
 #define SAFETY_STM32_BAUD_DEFAULT 115200
 
+#define SAFETY_ACT_DEVICE_POWER_ON 0x0001
+#define SAFETY_ACT_FAN_ON 0x0002
+#define SAFETY_ACT_ALARM_ON 0x0004
+#define SAFETY_ACT_INTERLOCK 0x0008
+#define SAFETY_ACT_RESET_WAIT 0x0010
+
 typedef enum {
-    SAFETY_MSG_HEARTBEAT = 0x01,
-    SAFETY_MSG_AI_STATUS = 0x02,
-    SAFETY_MSG_FUSION_DECISION = 0x03,
-    SAFETY_MSG_EVENT_ACK = 0x04,
-    SAFETY_MSG_STM32_STATE = 0x81,
-    SAFETY_MSG_SENSOR_DATA = 0x82,
-    SAFETY_MSG_ACTUATOR_STATE = 0x83,
-    SAFETY_MSG_INTERLOCK_EVENT = 0x84,
-    SAFETY_MSG_FAULT_EVENT = 0x85
-} SafetyMessageType;
+    SAFETY_CODE_SAFE = 0x00,
+    SAFETY_CODE_PPE_DENY = 0x01,
+    SAFETY_CODE_FIRE_WORK_ZONE = 0x02,
+    SAFETY_CODE_FIRE_OUT_ZONE = 0x03,
+    SAFETY_CODE_INTRUSION = 0x04,
+    SAFETY_CODE_ENV_DANGER = 0x05,
+    SAFETY_CODE_FAULT = 0x06,
+    SAFETY_CODE_RESERVED = 0x07
+} SafetyCode;
+
+typedef enum {
+    SAFETY_STM32_CODE_SAFE = 0x80,
+    SAFETY_STM32_CODE_WORKING = 0x81,
+    SAFETY_STM32_CODE_POWER_OFF = 0x82,
+    SAFETY_STM32_CODE_INTERLOCK = 0x83,
+    SAFETY_STM32_CODE_ENV_DANGER = 0x84,
+    SAFETY_STM32_CODE_EMERGENCY_STOP = 0x85,
+    SAFETY_STM32_CODE_FAULT = 0x86,
+    SAFETY_STM32_CODE_RESET_WAIT = 0x87,
+    SAFETY_STM32_CODE_RESET_OK = 0x88,
+    SAFETY_STM32_CODE_FAN_ON = 0x89,
+    SAFETY_STM32_CODE_ALARM_ON = 0x8A,
+    SAFETY_STM32_CODE_START_REQUEST = 0x8B,
+    SAFETY_STM32_CODE_RESET_REQUEST = 0x8C
+} SafetyStm32Code;
 
 typedef enum {
     SAFETY_RK_STATE_INIT = 0,
@@ -93,6 +113,8 @@ typedef enum {
 
 typedef struct {
     int online;
+    int actuator_feedback_valid;
+    int expected_actuator_valid;
     uint8_t work_state;
     uint16_t stm32_flags;
     uint8_t fault_code;
@@ -101,6 +123,12 @@ typedef struct {
     uint16_t gas;
     int16_t temperature_x10;
     uint16_t actuator_flags;
+    uint16_t expected_actuator_flags;
+
+    uint8_t ai_detect_state;
+    uint8_t ai_confidence;
+    int ai_detect_valid;
+    int64_t ai_detect_update_ms;
 
     uint16_t last_event_id;
     uint8_t last_event_type;
@@ -136,6 +164,10 @@ int safety_client_init(SafetyInterlockClient *client,
 void safety_client_stop(SafetyInterlockClient *client);
 int safety_client_get_snapshot(SafetyInterlockClient *client,
                                SafetyStm32Snapshot *snapshot_out);
+int safety_client_update_ai_detect_state(SafetyInterlockClient *client,
+                                         uint8_t ai_detect_state,
+                                         uint8_t ai_confidence,
+                                         int64_t update_ms);
 int safety_client_send_ai_status(SafetyInterlockClient *client,
                                  uint16_t ai_flags,
                                  uint8_t ai_confidence);

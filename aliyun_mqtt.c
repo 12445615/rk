@@ -28,6 +28,8 @@
 
 #include "local_store.h"
 
+#include "safety_interlock_client.h"
+
 
 
 #if defined(__has_include)
@@ -58,17 +60,19 @@
 
 #define ADDRESS "tcp://iot-06z00be8pk7p1uz.mqtt.iothub.aliyuncs.com:1883"
 
-#define CLIENTID "k29ovUMboAH.0122|securemode=2,signmethod=hmacsha256,timestamp=1774788552812|"
+#define CLIENTID "k29ovUMboAH.0122-qt|securemode=2,signmethod=hmacsha256,timestamp=1780814592285|"
 
-#define USERNAME "0122&k29ovUMboAH"
+#define USERNAME "0122-qt&k29ovUMboAH"
 
-#define PASSWORD "83de467647429c49f5887f9ca57da2aebd92764176aa02bcb9e5175ea758e035"
+#define PASSWORD "13d2a39a934093962c3cb257db438e3b69a400c28f4267ff2ce5b0cf9d9f059a"
 
-#define TOPIC "/sys/k29ovUMboAH/0122/thing/event/property/post"
+#define TOPIC "/sys/k29ovUMboAH/0122-qt/thing/event/property/post"
 
 #define MQTT_REPORT_INTERVAL_SEC 10
 
 #define MQTT_OFFLINE_FLUSH_BATCH 10
+
+#define MQTT_AI_NONE_REPORT_INTERVAL_MS 60000
 
 
 
@@ -81,6 +85,20 @@ typedef struct {
     float humi;
 
     int alarm_status;
+
+    int power_switch;
+
+    int fan_status;
+
+    float combustible_gas;
+
+    float smoke_concentration;
+
+    int ai_detect_valid;
+
+    int ai_detect_state;
+
+    int ai_confidence;
 
 } SensorSnapshot;
 
@@ -97,6 +115,12 @@ static int g_mqtt_stop_fd = -1;
 static int g_mqtt_started = 0;
 
 static int g_mqtt_force_offline = 0;
+
+static SafetyInterlockClient *g_safety_client = NULL;
+
+static int g_last_reported_ai_state = -1;
+
+static int64_t g_last_ai_none_report_ms = 0;
 
 
 
@@ -121,6 +145,8 @@ static int64_t current_time_ms(void) {
 
 
 static void read_sensor_snapshot(SensorSnapshot *snapshot) {
+    SafetyStm32Snapshot stm32_snapshot;
+    int has_stm32_snapshot = 0;
 
     pthread_mutex_lock(&g_sensor_data.lock);
 
@@ -133,6 +159,47 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
     snapshot->alarm_status = g_sensor_data.alarm_status;
 
     pthread_mutex_unlock(&g_sensor_data.lock);
+
+    snapshot->power_switch = snapshot->alarm_status ? 0 : 1;
+    snapshot->fan_status = snapshot->alarm_status ? 1 : 0;
+    snapshot->combustible_gas = (float)snapshot->ppm;
+    snapshot->smoke_concentration = (float)snapshot->ppm;
+    snapshot->ai_detect_valid = 0;
+    snapshot->ai_detect_state = 0;
+    snapshot->ai_confidence = 0;
+
+    if (g_safety_client != NULL &&
+        safety_client_get_snapshot(g_safety_client, &stm32_snapshot) == 0 &&
+        stm32_snapshot.online) {
+        has_stm32_snapshot = 1;
+    }
+
+    if (has_stm32_snapshot && stm32_snapshot.actuator_feedback_valid) {
+        snapshot->power_switch =
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_DEVICE_POWER_ON) ? 1 : 0;
+        snapshot->fan_status =
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_FAN_ON) ? 1 : 0;
+        snapshot->alarm_status =
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_ALARM_ON) ? 1 : 0;
+    } else if (has_stm32_snapshot && stm32_snapshot.expected_actuator_valid) {
+        snapshot->power_switch =
+            (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_DEVICE_POWER_ON) ? 1 : 0;
+        snapshot->fan_status =
+            (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_FAN_ON) ? 1 : 0;
+        snapshot->alarm_status =
+            (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_ALARM_ON) ? 1 : 0;
+    }
+
+    if (has_stm32_snapshot) {
+        snapshot->combustible_gas = (float)stm32_snapshot.gas;
+        snapshot->smoke_concentration = (float)stm32_snapshot.smoke;
+        snapshot->temp = (float)stm32_snapshot.temperature_x10 / 10.0f;
+        if (stm32_snapshot.ai_detect_valid) {
+            snapshot->ai_detect_valid = 1;
+            snapshot->ai_detect_state = stm32_snapshot.ai_detect_state;
+            snapshot->ai_confidence = stm32_snapshot.ai_confidence;
+        }
+    }
 
 }
 
@@ -148,6 +215,34 @@ static void build_debug_snapshot(SensorSnapshot *snapshot, int seq) {
 
     snapshot->alarm_status = seq % 2;
 
+    snapshot->power_switch = snapshot->alarm_status ? 0 : 1;
+
+    snapshot->fan_status = snapshot->alarm_status ? 1 : 0;
+
+    snapshot->combustible_gas = (float)snapshot->ppm;
+
+    snapshot->smoke_concentration = (float)snapshot->ppm;
+
+    snapshot->ai_detect_valid = 1;
+
+    snapshot->ai_detect_state = seq % 8;
+
+    snapshot->ai_confidence = 80;
+
+}
+
+static int should_report_ai_detect_state(const SensorSnapshot *snapshot,
+                                         int64_t created_at_ms) {
+    if (snapshot == NULL || !snapshot->ai_detect_valid) {
+        return 0;
+    }
+    if (snapshot->ai_detect_state != 0) {
+        return 1;
+    }
+    if (g_last_reported_ai_state != 0) {
+        return 1;
+    }
+    return created_at_ms - g_last_ai_none_report_ms >= MQTT_AI_NONE_REPORT_INTERVAL_MS;
 }
 
 
@@ -159,6 +254,11 @@ static int build_sensor_payload(char *payload,
                                 int64_t created_at_ms,
 
                                 const SensorSnapshot *snapshot) {
+
+    int alarm_state = snapshot->alarm_status ? 1 : 0;
+    int power_switch = snapshot->power_switch ? 1 : 0;
+    int fan_status = snapshot->fan_status ? 1 : 0;
+    int report_ai = should_report_ai_detect_state(snapshot, created_at_ms);
 
     int len = snprintf(payload,
 
@@ -172,13 +272,19 @@ static int build_sensor_payload(char *payload,
 
                        "\"params\":{"
 
+                       "\"PowerSwitch\":%d,"
+
+                       "\"Fanstatus\":%d,"
+
+                       "\"CombustibleGasCheck\":%.2f,"
+
+                       "\"AlarmState\":%d,"
+
                        "\"smokeconcentration\":%.2f,"
 
                        "\"Humidity\":%.2f,"
 
-                       "\"temperature\":%.2f,"
-
-                       "\"alarm_status\":%d"
+                       "\"temperature\":%.2f%s"
 
                        "},"
 
@@ -188,13 +294,44 @@ static int build_sensor_payload(char *payload,
 
                        (long long)created_at_ms,
 
-                       (double)snapshot->ppm,
+                       power_switch,
+
+                       fan_status,
+
+                       (double)snapshot->combustible_gas,
+
+                       alarm_state,
+
+                       (double)snapshot->smoke_concentration,
 
                        (double)snapshot->humi,
 
                        (double)snapshot->temp,
 
-                       snapshot->alarm_status);
+                       report_ai ? "" : "");
+
+    if (len >= 0 && (size_t)len < payload_size && report_ai) {
+        size_t used = (size_t)len;
+        const char *tail = "},\"method\":\"thing.event.property.post\"}";
+        size_t tail_len = strlen(tail);
+
+        if (used < tail_len || strcmp(&payload[used - tail_len], tail) != 0) {
+            return EINVAL;
+        }
+        used -= tail_len;
+        len = snprintf(&payload[used],
+                       payload_size - used,
+                       ",\"AiDetectState\":%d%s",
+                       snapshot->ai_detect_state,
+                       tail);
+        if (len < 0 || (size_t)len >= payload_size - used) {
+            return ENOSPC;
+        }
+        g_last_reported_ai_state = snapshot->ai_detect_state;
+        if (snapshot->ai_detect_state == 0) {
+            g_last_ai_none_report_ms = created_at_ms;
+        }
+    }
 
 
 
@@ -1034,6 +1171,12 @@ int start_mqtt_reporter(void) {
 
 }
 
+void set_mqtt_safety_client(SafetyInterlockClient *client) {
+
+    g_safety_client = client;
+
+}
+
 
 
 void stop_mqtt_reporter(void) {
@@ -1191,6 +1334,12 @@ int mqtt_debug_run_end_to_end_test(const char *root_dir) {
 int start_mqtt_reporter(void) {
 
     return ENOSYS;
+
+}
+
+void set_mqtt_safety_client(SafetyInterlockClient *client) {
+
+    (void)client;
 
 }
 

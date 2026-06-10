@@ -111,6 +111,7 @@ extern volatile sig_atomic_t is_running;
 static pthread_t g_mqtt_tid;
 
 static int g_mqtt_stop_fd = -1;
+static int g_mqtt_wakeup_fd = -1;
 
 static int g_mqtt_started = 0;
 
@@ -121,6 +122,12 @@ static SafetyInterlockClient *g_safety_client = NULL;
 static int g_last_reported_ai_state = -1;
 
 static int64_t g_last_ai_none_report_ms = 0;
+
+static pthread_mutex_t g_immediate_ai_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int g_immediate_ai_valid = 0;
+
+static int g_immediate_ai_state = 0;
 
 
 
@@ -169,8 +176,7 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
     snapshot->ai_confidence = 0;
 
     if (g_safety_client != NULL &&
-        safety_client_get_snapshot(g_safety_client, &stm32_snapshot) == 0 &&
-        stm32_snapshot.online) {
+        safety_client_get_snapshot(g_safety_client, &stm32_snapshot) == 0) {
         has_stm32_snapshot = 1;
     }
 
@@ -190,16 +196,32 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
             (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_ALARM_ON) ? 1 : 0;
     }
 
-    if (has_stm32_snapshot) {
+    if (has_stm32_snapshot && stm32_snapshot.online) {
         snapshot->combustible_gas = (float)stm32_snapshot.gas;
         snapshot->smoke_concentration = (float)stm32_snapshot.smoke;
         snapshot->temp = (float)stm32_snapshot.temperature_x10 / 10.0f;
-        if (stm32_snapshot.ai_detect_valid) {
-            snapshot->ai_detect_valid = 1;
-            snapshot->ai_detect_state = stm32_snapshot.ai_detect_state;
-            snapshot->ai_confidence = stm32_snapshot.ai_confidence;
+        if (stm32_snapshot.fault_code != 0 ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_INTERLOCK ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_EMERGENCY_STOP ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_FAULT ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_RESET_WAIT ||
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_RESET_WAIT)) {
+            snapshot->alarm_status = 1;
         }
     }
+    if (has_stm32_snapshot && stm32_snapshot.ai_detect_valid) {
+        snapshot->ai_detect_valid = 1;
+        snapshot->ai_detect_state = stm32_snapshot.ai_detect_state;
+        snapshot->ai_confidence = stm32_snapshot.ai_confidence;
+    }
+
+    pthread_mutex_lock(&g_immediate_ai_lock);
+    if (g_immediate_ai_valid) {
+        snapshot->ai_detect_valid = 1;
+        snapshot->ai_detect_state = g_immediate_ai_state;
+        g_immediate_ai_valid = 0;
+    }
+    pthread_mutex_unlock(&g_immediate_ai_lock);
 
 }
 
@@ -231,22 +253,6 @@ static void build_debug_snapshot(SensorSnapshot *snapshot, int seq) {
 
 }
 
-static int should_report_ai_detect_state(const SensorSnapshot *snapshot,
-                                         int64_t created_at_ms) {
-    if (snapshot == NULL || !snapshot->ai_detect_valid) {
-        return 0;
-    }
-    if (snapshot->ai_detect_state != 0) {
-        return 1;
-    }
-    if (g_last_reported_ai_state != 0) {
-        return 1;
-    }
-    return created_at_ms - g_last_ai_none_report_ms >= MQTT_AI_NONE_REPORT_INTERVAL_MS;
-}
-
-
-
 static int build_sensor_payload(char *payload,
 
                                 size_t payload_size,
@@ -258,7 +264,7 @@ static int build_sensor_payload(char *payload,
     int alarm_state = snapshot->alarm_status ? 1 : 0;
     int power_switch = snapshot->power_switch ? 1 : 0;
     int fan_status = snapshot->fan_status ? 1 : 0;
-    int report_ai = should_report_ai_detect_state(snapshot, created_at_ms);
+    int ai_detect_state = snapshot->ai_detect_valid ? snapshot->ai_detect_state : 0;
 
     int len = snprintf(payload,
 
@@ -284,7 +290,9 @@ static int build_sensor_payload(char *payload,
 
                        "\"Humidity\":%.2f,"
 
-                       "\"temperature\":%.2f%s"
+                       "\"temperature\":%.2f,"
+
+                       "\"AiDetectState\":%d"
 
                        "},"
 
@@ -307,30 +315,12 @@ static int build_sensor_payload(char *payload,
                        (double)snapshot->humi,
 
                        (double)snapshot->temp,
-
-                       report_ai ? "" : "");
-
-    if (len >= 0 && (size_t)len < payload_size && report_ai) {
-        size_t used = (size_t)len;
-        const char *tail = "},\"method\":\"thing.event.property.post\"}";
-        size_t tail_len = strlen(tail);
-
-        if (used < tail_len || strcmp(&payload[used - tail_len], tail) != 0) {
-            return EINVAL;
-        }
-        used -= tail_len;
-        len = snprintf(&payload[used],
-                       payload_size - used,
-                       ",\"AiDetectState\":%d%s",
-                       snapshot->ai_detect_state,
-                       tail);
-        if (len < 0 || (size_t)len >= payload_size - used) {
-            return ENOSPC;
-        }
-        g_last_reported_ai_state = snapshot->ai_detect_state;
-        if (snapshot->ai_detect_state == 0) {
-            g_last_ai_none_report_ms = created_at_ms;
-        }
+                       ai_detect_state);
+    g_last_reported_ai_state = ai_detect_state;
+    if (ai_detect_state == 0) {
+        g_last_ai_none_report_ms = created_at_ms;
+    } else {
+        printf("[阿里云] AiDetectState=%d will be reported\n", ai_detect_state);
     }
 
 
@@ -861,7 +851,7 @@ static void *mqtt_thread_func(void *arg) {
 
     LocalStore store;
 
-    struct pollfd fds[2];
+    struct pollfd fds[3];
 
     int store_ready = 0;
 
@@ -953,11 +943,15 @@ static void *mqtt_thread_func(void *arg) {
 
     fds[1].events = POLLIN;
 
+    fds[2].fd = g_mqtt_wakeup_fd;
+
+    fds[2].events = POLLIN;
+
 
 
     while (1) {
 
-        rc = poll(fds, 2, -1);
+        rc = poll(fds, 3, -1);
 
         if (rc < 0) {
 
@@ -993,7 +987,7 @@ static void *mqtt_thread_func(void *arg) {
 
 
 
-        if (fds[0].revents & POLLIN) {
+        if ((fds[0].revents & POLLIN) || (fds[2].revents & POLLIN)) {
 
             uint64_t expirations = 0;
 
@@ -1005,7 +999,8 @@ static void *mqtt_thread_func(void *arg) {
 
 
 
-            if (read(timer_fd, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations)) {
+            if ((fds[0].revents & POLLIN) &&
+                read(timer_fd, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations)) {
 
                 if (errno != EINTR) {
 
@@ -1015,6 +1010,14 @@ static void *mqtt_thread_func(void *arg) {
 
                 continue;
 
+            }
+
+            if (fds[2].revents & POLLIN) {
+                while (read(g_mqtt_wakeup_fd, &expirations, sizeof(expirations)) == (ssize_t)sizeof(expirations)) {
+                }
+                if (errno != EAGAIN && errno != EINTR) {
+                    perror("mqtt wake eventfd read");
+                }
             }
 
 
@@ -1149,6 +1152,17 @@ int start_mqtt_reporter(void) {
 
     }
 
+    g_mqtt_wakeup_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+
+    if (g_mqtt_wakeup_fd < 0) {
+
+        rc = errno;
+        close(g_mqtt_stop_fd);
+        g_mqtt_stop_fd = -1;
+        return rc;
+
+    }
+
 
 
     rc = pthread_create(&g_mqtt_tid, NULL, mqtt_thread_func, NULL);
@@ -1158,6 +1172,8 @@ int start_mqtt_reporter(void) {
         close(g_mqtt_stop_fd);
 
         g_mqtt_stop_fd = -1;
+        close(g_mqtt_wakeup_fd);
+        g_mqtt_wakeup_fd = -1;
 
         return rc;
 
@@ -1204,12 +1220,44 @@ void stop_mqtt_reporter(void) {
     pthread_join(g_mqtt_tid, NULL);
 
     close(g_mqtt_stop_fd);
+    close(g_mqtt_wakeup_fd);
 
 
 
     g_mqtt_stop_fd = -1;
+    g_mqtt_wakeup_fd = -1;
 
     g_mqtt_started = 0;
+
+}
+
+void mqtt_request_immediate_ai_report(uint8_t ai_detect_state) {
+
+    uint64_t one = 1;
+
+    if (ai_detect_state == 0) {
+
+        return;
+
+    }
+
+    pthread_mutex_lock(&g_immediate_ai_lock);
+    g_immediate_ai_valid = 1;
+    g_immediate_ai_state = ai_detect_state;
+    pthread_mutex_unlock(&g_immediate_ai_lock);
+
+    if (!g_mqtt_started || g_mqtt_wakeup_fd < 0) {
+
+        return;
+
+    }
+
+    if (write(g_mqtt_wakeup_fd, &one, sizeof(one)) < 0 &&
+        errno != EAGAIN) {
+
+        perror("mqtt wake eventfd write");
+
+    }
 
 }
 

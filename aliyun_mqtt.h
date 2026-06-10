@@ -6,6 +6,7 @@
 int start_mqtt_reporter(void);
 void stop_mqtt_reporter(void);
 void set_mqtt_safety_client(SafetyInterlockClient *client);
+void mqtt_request_immediate_ai_report(uint8_t ai_detect_state);
 
 int mqtt_debug_set_force_offline(int enabled);
 int mqtt_debug_enqueue_fake_record(const char *root_dir, const char *payload);

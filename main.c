@@ -54,6 +54,9 @@
 #define STREAM_DUP_FRAMES_DEFAULT 1
 #define CHILD_RTMP_RETRY_BASE_MS 1000
 #define CHILD_RTMP_RETRY_MAX_MS 30000
+#define CHILD_TARGET_RECORD_GRACE_MS 3000
+#define CHILD_TARGET_RECORD_SEGMENT_MIN_MS 20000
+#define CHILD_TARGET_RECORD_SEGMENT_MAX_MS 60000
 #define AI_ENABLE_ENV "CAMERA_FLOW_AI_ENABLE"
 #define AI_MODEL_PATH_ENV "CAMERA_FLOW_AI_MODEL_PATH"
 #define AI_INTERVAL_ENV "CAMERA_FLOW_AI_INTERVAL"
@@ -64,9 +67,12 @@
 #define SAFETY_AI_STALE_MS 1500
 #define SAFETY_AI_SEND_INTERVAL_MS 500
 #define SAFETY_FUSION_SEND_INTERVAL_MS 500
+#define SAFETY_CONFIRM_DELAY_MS 5000
 #define SAFETY_SMOKE_HIGH_ENV "SAFETY_SMOKE_HIGH"
 #define SAFETY_GAS_HIGH_ENV "SAFETY_GAS_HIGH"
 #define SAFETY_TEMP_HIGH_X10_ENV "SAFETY_TEMP_HIGH_X10"
+#define SAFETY_SMOKE_RISE_ENV "SAFETY_SMOKE_RISE_DELTA"
+#define SAFETY_TEMP_RISE_X10_ENV "SAFETY_TEMP_RISE_X10_DELTA"
 #define SAFETY_WORK_ZONE_ENV "SAFETY_WORK_ZONE"
 #define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
 #define SAFETY_WORK_ZONE_DEFAULT "520,220,880,560"
@@ -74,6 +80,8 @@
 #define SAFETY_SMOKE_HIGH_DEFAULT 600
 #define SAFETY_GAS_HIGH_DEFAULT 500
 #define SAFETY_TEMP_HIGH_X10_DEFAULT 600
+#define SAFETY_SMOKE_RISE_DEFAULT 50
+#define SAFETY_TEMP_RISE_X10_DEFAULT 30
 #define SAFETY_AI_FLAG_VALID       (1u << 0)
 #define SAFETY_AI_FLAG_PPE_OK      (1u << 1)
 #define SAFETY_AI_FLAG_NO_HELMET   (1u << 2)
@@ -127,6 +135,14 @@ typedef struct {
     int64_t current_segment_start_wall_ms;
     int64_t current_segment_start_mono_ms;
     char current_segment_path[PATH_MAX];
+
+    FFmpegStreamer record_streamer;
+    int record_streamer_ready;
+    int64_t record_segment_id;
+    int64_t record_segment_start_wall_ms;
+    int64_t record_segment_start_mono_ms;
+    int64_t record_target_last_seen_mono_ms;
+    char record_segment_path[PATH_MAX];
 
     int rtmp_retry_backoff_ms;
     int rtmp_retry_max_ms;
@@ -616,6 +632,16 @@ typedef struct {
     uint8_t last_voice_action;
     uint8_t last_stm32_action;
     uint8_t last_explain_code;
+    int64_t ppe_first_seen_ms;
+    int64_t intrusion_first_seen_ms;
+    int64_t sensor_baseline_ms;
+    uint16_t baseline_smoke;
+    int16_t baseline_temperature_x10;
+    int fire_locked;
+    int fire_lock_sent;
+    int emergency_locked;
+    int fault_locked;
+    int suppress_fusion_send;
     int initialized;
 } SafetyRuntimeState;
 
@@ -801,8 +827,39 @@ static void safety_build_ai_status(DetectSharedState *shared,
     *ai_confidence_out = confidence;
 }
 
-static void safety_evaluate_fusion(uint16_t ai_flags,
+static int safety_sensor_rise_high(SafetyRuntimeState *state,
                                    const SafetyStm32Snapshot *stm32,
+                                   int64_t frame_mono_ms) {
+    int smoke_rise = env_to_positive_int(SAFETY_SMOKE_RISE_ENV, SAFETY_SMOKE_RISE_DEFAULT);
+    int temp_rise_x10 = env_to_positive_int(SAFETY_TEMP_RISE_X10_ENV, SAFETY_TEMP_RISE_X10_DEFAULT);
+
+    if (state == NULL || stm32 == NULL || !stm32->online) {
+        return 0;
+    }
+
+    if (state->sensor_baseline_ms == 0 ||
+        frame_mono_ms - state->sensor_baseline_ms > SAFETY_CONFIRM_DELAY_MS) {
+        state->sensor_baseline_ms = frame_mono_ms;
+        state->baseline_smoke = stm32->smoke;
+        state->baseline_temperature_x10 = stm32->temperature_x10;
+        return 0;
+    }
+
+    if (stm32->smoke >= state->baseline_smoke &&
+        stm32->smoke - state->baseline_smoke >= (uint16_t)smoke_rise) {
+        return 1;
+    }
+    if (stm32->temperature_x10 >= state->baseline_temperature_x10 &&
+        stm32->temperature_x10 - state->baseline_temperature_x10 >= temp_rise_x10) {
+        return 1;
+    }
+    return 0;
+}
+
+static void safety_evaluate_fusion(SafetyRuntimeState *state,
+                                   uint16_t ai_flags,
+                                   const SafetyStm32Snapshot *stm32,
+                                   int64_t frame_mono_ms,
                                    uint8_t *permit_decision,
                                    uint8_t *risk_level,
                                    uint8_t *risk_type,
@@ -812,6 +869,10 @@ static void safety_evaluate_fusion(uint16_t ai_flags,
     int smoke_high = env_to_positive_int(SAFETY_SMOKE_HIGH_ENV, SAFETY_SMOKE_HIGH_DEFAULT);
     int gas_high = env_to_positive_int(SAFETY_GAS_HIGH_ENV, SAFETY_GAS_HIGH_DEFAULT);
     int temp_high_x10 = env_to_positive_int(SAFETY_TEMP_HIGH_X10_ENV, SAFETY_TEMP_HIGH_X10_DEFAULT);
+    int ppe_bad = (ai_flags & (SAFETY_AI_FLAG_NO_HELMET | SAFETY_AI_FLAG_NO_VEST)) != 0;
+    int intrusion = (ai_flags & SAFETY_AI_FLAG_INTRUSION) != 0;
+    int stm32_online = stm32 != NULL && stm32->online;
+    int reset_ok = stm32 != NULL && stm32->last_event_type == SAFETY_STM32_CODE_RESET_OK;
 
     *permit_decision = SAFETY_PERMIT_DENY;
     *risk_level = SAFETY_RISK_WARNING;
@@ -819,24 +880,38 @@ static void safety_evaluate_fusion(uint16_t ai_flags,
     *voice_action = SAFETY_VOICE_NONE;
     *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
     *explain_code = 0;
+    if (state != NULL) {
+        state->suppress_fusion_send = 0;
+    }
 
-    if (stm32 == NULL || !stm32->online) {
-        *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
-        *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
-        *explain_code = 81;
+    if (state != NULL && reset_ok) {
+        state->fire_locked = 0;
+        state->fire_lock_sent = 0;
+        state->emergency_locked = 0;
+        state->fault_locked = 0;
+        state->ppe_first_seen_ms = 0;
+        state->intrusion_first_seen_ms = 0;
+    }
+
+    if ((stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_EMERGENCY_STOP) ||
+        (state != NULL && state->emergency_locked)) {
+        if (state != NULL) {
+            state->emergency_locked = 1;
+        }
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_EMERGENCY_STOP;
+        *voice_action = SAFETY_VOICE_EMERGENCY_STOP;
+        *stm32_action = SAFETY_STM32_ACTION_LOCKOUT_WAIT_RESET;
+        *explain_code = 85;
         return;
     }
 
-    if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
-        *risk_type = SAFETY_RISK_TYPE_NONE;
-        *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP;
-        *explain_code = 23;
-        return;
-    }
-
-    if (stm32->fault_code != 0) {
+    if ((stm32_online && stm32->fault_code != 0) ||
+        (stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_FAULT) ||
+        (state != NULL && state->fault_locked)) {
+        if (state != NULL) {
+            state->fault_locked = 1;
+        }
         *risk_level = SAFETY_RISK_CRITICAL;
         *risk_type = SAFETY_RISK_TYPE_STM32_FAULT;
         *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_ALARM;
@@ -844,43 +919,100 @@ static void safety_evaluate_fusion(uint16_t ai_flags,
         return;
     }
 
-    if (stm32 != NULL && stm32->online) {
-        if (stm32->smoke >= (uint16_t)smoke_high) {
-            *risk_level = SAFETY_RISK_CRITICAL;
-            *risk_type = SAFETY_RISK_TYPE_ENV;
-            *voice_action = SAFETY_VOICE_ENV_WARNING;
-            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
-            *explain_code = 61;
-            return;
-        }
-        if (stm32->gas >= (uint16_t)gas_high) {
-            *risk_level = SAFETY_RISK_CRITICAL;
-            *risk_type = SAFETY_RISK_TYPE_ENV;
-            *voice_action = SAFETY_VOICE_ENV_WARNING;
-            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
-            *explain_code = 62;
-            return;
-        }
-        if (stm32->temperature_x10 >= temp_high_x10) {
-            *risk_level = SAFETY_RISK_CRITICAL;
-            *risk_type = SAFETY_RISK_TYPE_ENV;
-            *voice_action = SAFETY_VOICE_ENV_WARNING;
-            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
-            *explain_code = 63;
-            return;
-        }
+    if ((stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_RESET_WAIT) ||
+        (stm32_online && (stm32->actuator_flags & SAFETY_ACT_RESET_WAIT))) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_STM32_FAULT;
+        *voice_action = SAFETY_VOICE_WAIT_RESET;
+        *stm32_action = SAFETY_STM32_ACTION_LOCKOUT_WAIT_RESET;
+        *explain_code = 87;
+        return;
     }
 
-    if (ai_flags & SAFETY_AI_FLAG_INTRUSION) {
+    if (state != NULL && state->fire_locked) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_FIRE;
+        *voice_action = SAFETY_VOICE_FIRE_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_LOCKOUT_WAIT_RESET;
+        *explain_code = 42;
+        if (state->fire_lock_sent) {
+            state->suppress_fusion_send = 1;
+        }
+        return;
+    }
+
+    if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
+        if (!stm32_online) {
+            *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
+            *voice_action = SAFETY_VOICE_NONE;
+            *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+            *explain_code = 81;
+            return;
+        }
+        *permit_decision = SAFETY_PERMIT_ALLOW;
+        *risk_level = SAFETY_RISK_SAFE;
+        *risk_type = SAFETY_RISK_TYPE_NONE;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *explain_code = 12;
+        return;
+    }
+
+    if (stm32_online && stm32->smoke >= (uint16_t)smoke_high) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_ENV;
+        *voice_action = SAFETY_VOICE_ENV_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+        *explain_code = 61;
+        return;
+    }
+    if (stm32_online && stm32->gas >= (uint16_t)gas_high) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_ENV;
+        *voice_action = SAFETY_VOICE_ENV_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+        *explain_code = 62;
+        return;
+    }
+    if (stm32_online && stm32->temperature_x10 >= temp_high_x10) {
+        *risk_level = SAFETY_RISK_CRITICAL;
+        *risk_type = SAFETY_RISK_TYPE_ENV;
+        *voice_action = SAFETY_VOICE_ENV_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+        *explain_code = 63;
+        return;
+    }
+
+    if (intrusion) {
+        if (state != NULL && state->intrusion_first_seen_ms == 0) {
+            state->intrusion_first_seen_ms = frame_mono_ms;
+        }
+    } else if (state != NULL) {
+        state->intrusion_first_seen_ms = 0;
+    }
+
+    if (intrusion) {
         *risk_level = SAFETY_RISK_DANGER;
-        *risk_type = SAFETY_RISK_TYPE_INTRUSION;
         *voice_action = SAFETY_VOICE_INTRUSION_WARNING;
         *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_ALARM;
         *explain_code = 51;
+        if (state != NULL &&
+            frame_mono_ms - state->intrusion_first_seen_ms >= SAFETY_CONFIRM_DELAY_MS) {
+            *risk_type = SAFETY_RISK_TYPE_INTRUSION;
+        } else {
+            *risk_type = SAFETY_RISK_TYPE_NONE;
+            *stm32_action = SAFETY_STM32_ACTION_KEEP;
+            if (state != NULL) {
+                state->suppress_fusion_send = 1;
+            }
+        }
         return;
     }
 
     if (ai_flags & SAFETY_AI_FLAG_FIRE_OUT) {
+        if (state != NULL) {
+            state->fire_locked = 1;
+        }
         *risk_level = SAFETY_RISK_CRITICAL;
         *risk_type = SAFETY_RISK_TYPE_FIRE;
         *voice_action = SAFETY_VOICE_FIRE_WARNING;
@@ -890,27 +1022,56 @@ static void safety_evaluate_fusion(uint16_t ai_flags,
     }
 
     if (ai_flags & SAFETY_AI_FLAG_FIRE) {
-        *risk_level = SAFETY_RISK_CRITICAL;
+        if (safety_sensor_rise_high(state, stm32, frame_mono_ms)) {
+            if (state != NULL) {
+                state->fire_locked = 1;
+            }
+            *risk_level = SAFETY_RISK_CRITICAL;
+            *risk_type = SAFETY_RISK_TYPE_FIRE;
+            *voice_action = SAFETY_VOICE_FIRE_WARNING;
+            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+            *explain_code = 42;
+            return;
+        }
+
+        *risk_level = SAFETY_RISK_WARNING;
         *risk_type = SAFETY_RISK_TYPE_FIRE;
-        *voice_action = SAFETY_VOICE_FIRE_WARNING;
-        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP;
         *explain_code = 41;
         return;
     }
 
-    if (ai_flags & SAFETY_AI_FLAG_NO_HELMET) {
+    if (ppe_bad) {
+        if (state != NULL && state->ppe_first_seen_ms == 0) {
+            state->ppe_first_seen_ms = frame_mono_ms;
+        }
         *risk_type = SAFETY_RISK_TYPE_PPE;
         *voice_action = SAFETY_VOICE_PPE_WARNING;
         *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
-        *explain_code = 21;
+        if ((ai_flags & SAFETY_AI_FLAG_NO_HELMET) && (ai_flags & SAFETY_AI_FLAG_NO_VEST)) {
+            *explain_code = 24;
+        } else if (ai_flags & SAFETY_AI_FLAG_NO_VEST) {
+            *explain_code = 22;
+        } else {
+            *explain_code = 21;
+        }
+        if (state != NULL &&
+            frame_mono_ms - state->ppe_first_seen_ms < SAFETY_CONFIRM_DELAY_MS) {
+            *risk_type = SAFETY_RISK_TYPE_NONE;
+            *stm32_action = SAFETY_STM32_ACTION_KEEP;
+            state->suppress_fusion_send = 1;
+        }
         return;
+    } else if (state != NULL) {
+        state->ppe_first_seen_ms = 0;
     }
 
-    if (ai_flags & SAFETY_AI_FLAG_NO_VEST) {
-        *risk_type = SAFETY_RISK_TYPE_PPE;
-        *voice_action = SAFETY_VOICE_PPE_WARNING;
+    if (!stm32_online) {
+        *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
+        *voice_action = SAFETY_VOICE_NONE;
         *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
-        *explain_code = 22;
+        *explain_code = 81;
         return;
     }
 
@@ -934,10 +1095,12 @@ static void safety_evaluate_fusion(uint16_t ai_flags,
         return;
     }
 
-    *risk_type = SAFETY_RISK_TYPE_PPE;
-    *voice_action = SAFETY_VOICE_PPE_WARNING;
-    *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
-    *explain_code = 23;
+    *permit_decision = SAFETY_PERMIT_ALLOW;
+    *risk_level = SAFETY_RISK_SAFE;
+    *risk_type = SAFETY_RISK_TYPE_NONE;
+    *voice_action = SAFETY_VOICE_NONE;
+    *stm32_action = SAFETY_STM32_ACTION_KEEP;
+    *explain_code = 13;
 }
 
 static uint8_t safety_ai_flags_to_detect_state(uint16_t ai_flags) {
@@ -984,16 +1147,18 @@ static void safety_audio_update_from_fusion(const SafetyRuntimeState *state,
         return;
     }
 
-    if (state->risk_type == SAFETY_RISK_TYPE_FIRE) {
+    if (state->voice_action == SAFETY_VOICE_FIRE_WARNING) {
         if (state->explain_code == 42 || !safety_work_zone_configured()) {
             command = 1;
         }
-    } else if (state->risk_type == SAFETY_RISK_TYPE_INTRUSION) {
+    } else if (state->voice_action == SAFETY_VOICE_INTRUSION_WARNING) {
         command = 4;
-    } else if (state->risk_type == SAFETY_RISK_TYPE_PPE) {
+    } else if (state->voice_action == SAFETY_VOICE_PPE_WARNING) {
         if (state->explain_code == 22) {
             command = 2;
         } else if (state->explain_code == 21) {
+            command = 3;
+        } else if (state->explain_code == 24) {
             command = 3;
         }
     }
@@ -1009,6 +1174,8 @@ static void safety_runtime_update(SafetyInterlockClient *client,
     SafetyStm32Snapshot stm32_snapshot;
     int ai_changed;
     int fusion_changed;
+    uint8_t ai_detect_state;
+    uint8_t last_ai_detect_state;
 
     if (client == NULL || state == NULL) {
         return;
@@ -1019,18 +1186,26 @@ static void safety_runtime_update(SafetyInterlockClient *client,
                            &state->ai_flags,
                            &state->ai_confidence);
     safety_client_get_snapshot(client, &stm32_snapshot);
-    safety_evaluate_fusion(state->ai_flags,
+    safety_evaluate_fusion(state,
+                           state->ai_flags,
                            &stm32_snapshot,
+                           frame_mono_ms,
                            &state->permit_decision,
                            &state->risk_level,
                            &state->risk_type,
                            &state->voice_action,
                            &state->stm32_action,
                            &state->explain_code);
+    ai_detect_state = safety_ai_flags_to_detect_state(state->ai_flags);
+    last_ai_detect_state = safety_ai_flags_to_detect_state(state->last_ai_flags);
     safety_client_update_ai_detect_state(client,
-                                         safety_ai_flags_to_detect_state(state->ai_flags),
+                                         ai_detect_state,
                                          state->ai_confidence,
                                          frame_wall_ms);
+    if (ai_detect_state != AI_DETECT_STATE_NONE &&
+        (!state->initialized || ai_detect_state != last_ai_detect_state)) {
+        mqtt_request_immediate_ai_report(ai_detect_state);
+    }
     safety_audio_update_from_fusion(state, frame_wall_ms);
 
     ai_changed = !state->initialized ||
@@ -1054,9 +1229,10 @@ static void safety_runtime_update(SafetyInterlockClient *client,
         }
     }
 
-    if (fusion_changed ||
+    if (!state->suppress_fusion_send &&
+        (fusion_changed ||
         state->last_fusion_send_ms == 0 ||
-        frame_mono_ms - state->last_fusion_send_ms >= SAFETY_FUSION_SEND_INTERVAL_MS) {
+        frame_mono_ms - state->last_fusion_send_ms >= SAFETY_FUSION_SEND_INTERVAL_MS)) {
         if (safety_client_send_fusion_decision(client,
                                                state->permit_decision,
                                                state->risk_level,
@@ -1071,6 +1247,10 @@ static void safety_runtime_update(SafetyInterlockClient *client,
             state->last_stm32_action = state->stm32_action;
             state->last_explain_code = state->explain_code;
             state->last_fusion_send_ms = frame_mono_ms;
+            if (state->risk_type == SAFETY_RISK_TYPE_FIRE &&
+                state->risk_level == SAFETY_RISK_CRITICAL) {
+                state->fire_lock_sent = 1;
+            }
         }
     }
 
@@ -1290,6 +1470,164 @@ static int child_open_file_segment(ChildOutputCtx *ctx,
     return 0;
 }
 
+static void child_reset_record_streamer(ChildOutputCtx *ctx) {
+    memset(&ctx->record_streamer, 0, sizeof(ctx->record_streamer));
+    ctx->record_streamer_ready = 0;
+}
+
+static int child_close_record_segment(ChildOutputCtx *ctx, int broken) {
+    int64_t end_ms;
+    int64_t size_bytes = 0;
+    int rc = 0;
+
+    if (!ctx->record_streamer_ready) {
+        return 0;
+    }
+
+    end_ms = wall_now_ms();
+    streamer_clean(&ctx->record_streamer);
+    child_reset_record_streamer(ctx);
+
+    rc = video_store_get_file_size(ctx->record_segment_path, &size_bytes);
+    if (rc != 0) {
+        fprintf(stderr, "[Child] Failed to stat target segment %s: %d\n",
+                ctx->record_segment_path, rc);
+        size_bytes = 0;
+    }
+
+    if (ctx->record_segment_id > 0) {
+        if (broken) {
+            rc = video_store_mark_segment_broken(&ctx->video_store,
+                                                 ctx->record_segment_id,
+                                                 end_ms,
+                                                 size_bytes);
+        } else {
+            rc = video_store_finish_segment(&ctx->video_store,
+                                            ctx->record_segment_id,
+                                            end_ms,
+                                            size_bytes);
+        }
+        if (rc != 0) {
+            fprintf(stderr, "[Child] Failed to update target segment metadata: %d\n", rc);
+        }
+    }
+
+    printf("[Child] Target local segment closed: %s size=%lld\n",
+           ctx->record_segment_path, (long long)size_bytes);
+    ctx->record_segment_id = 0;
+    ctx->record_segment_start_wall_ms = 0;
+    ctx->record_segment_start_mono_ms = 0;
+    ctx->record_target_last_seen_mono_ms = 0;
+    ctx->record_segment_path[0] = '\0';
+    return 0;
+}
+
+static int child_open_record_segment(ChildOutputCtx *ctx,
+                                     int64_t start_wall_ms,
+                                     int64_t start_mono_ms) {
+    int rc;
+    int64_t segment_id = 0;
+    char segment_path[PATH_MAX];
+
+    if (!ctx->video_store_ready || ctx->record_streamer_ready) {
+        return ctx->record_streamer_ready ? 0 : -1;
+    }
+
+    rc = video_store_build_segment_path(&ctx->video_store,
+                                        start_wall_ms,
+                                        segment_path,
+                                        sizeof(segment_path));
+    if (rc != 0) {
+        fprintf(stderr, "[Child] Failed to build target segment path: %d\n", rc);
+        return -1;
+    }
+
+    rc = video_store_begin_segment(&ctx->video_store,
+                                   start_wall_ms,
+                                   segment_path,
+                                   &segment_id);
+    if (rc != 0) {
+        fprintf(stderr, "[Child] Failed to register target segment: %d\n", rc);
+        return -1;
+    }
+
+    child_reset_record_streamer(ctx);
+    if (streamer_init(&ctx->record_streamer,
+                      segment_path,
+                      WIDTH,
+                      HEIGHT,
+                      env_to_positive_int(STREAM_FPS_ENV, STREAM_FPS_DEFAULT)) < 0) {
+        fprintf(stderr, "[Child] Streamer init failed for target segment\n");
+        local_store_delete_video_segment(&ctx->store, segment_id);
+        child_reset_record_streamer(ctx);
+        return -1;
+    }
+
+    ctx->record_streamer_ready = 1;
+    ctx->record_segment_id = segment_id;
+    ctx->record_segment_start_wall_ms = start_wall_ms;
+    ctx->record_segment_start_mono_ms = start_mono_ms;
+    ctx->record_target_last_seen_mono_ms = start_mono_ms;
+    snprintf(ctx->record_segment_path, sizeof(ctx->record_segment_path), "%s", segment_path);
+    printf("[Child] Target local segment started: %s\n", ctx->record_segment_path);
+    return 0;
+}
+
+static int child_overlay_has_target(const DetectSharedState *overlay,
+                                    int64_t frame_wall_ms) {
+    return overlay != NULL &&
+           overlay->valid &&
+           overlay->box_count > 0 &&
+           overlay->timestamp_ms > 0 &&
+           frame_wall_ms - overlay->timestamp_ms <= SAFETY_AI_STALE_MS;
+}
+
+static int child_update_target_recording(ChildOutputCtx *ctx,
+                                         int dma_fd,
+                                         const DetectSharedState *overlay,
+                                         int64_t frame_mono_ms,
+                                         int64_t frame_wall_ms) {
+    int has_target = child_overlay_has_target(overlay, frame_wall_ms);
+    int ret;
+
+    if (!ctx->video_store_ready) {
+        return 0;
+    }
+
+    if (has_target) {
+        ctx->record_target_last_seen_mono_ms = frame_mono_ms;
+        if (!ctx->record_streamer_ready &&
+            child_open_record_segment(ctx, frame_wall_ms, frame_mono_ms) != 0) {
+            return 0;
+        }
+    }
+
+    if (ctx->record_streamer_ready &&
+        frame_mono_ms - ctx->record_segment_start_mono_ms >= CHILD_TARGET_RECORD_SEGMENT_MAX_MS) {
+        child_close_record_segment(ctx, 0);
+        if (has_target) {
+            child_open_record_segment(ctx, frame_wall_ms, frame_mono_ms);
+        }
+    }
+
+    if (ctx->record_streamer_ready) {
+        if (!has_target &&
+            frame_mono_ms - ctx->record_segment_start_mono_ms >= CHILD_TARGET_RECORD_SEGMENT_MIN_MS &&
+            frame_mono_ms - ctx->record_target_last_seen_mono_ms >= CHILD_TARGET_RECORD_GRACE_MS) {
+            child_close_record_segment(ctx, 0);
+            return 0;
+        }
+
+        ret = streamer_push_zerocopy_overlay(&ctx->record_streamer, dma_fd, overlay);
+        if (ret < 0) {
+            fprintf(stderr, "[Child] Target local segment push failed, close broken segment.\n");
+            child_close_record_segment(ctx, 1);
+        }
+    }
+
+    return 0;
+}
+
 static int child_switch_to_file_mode(ChildOutputCtx *ctx,
                                      int64_t frame_mono_ms,
                                      int64_t frame_wall_ms) {
@@ -1466,6 +1804,12 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
             break;
         }
 
+        child_update_target_recording(&ctx,
+                                      child_fd,
+                                      overlay,
+                                      frame_mono_ms,
+                                      frame_wall_ms);
+
         char ack = 'k';
         if (write(sock, &ack, 1) <= 0) {
             close(child_fd);
@@ -1480,6 +1824,9 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
     } else if (ctx.streamer_ready) {
         streamer_clean(&ctx.streamer);
         child_reset_streamer(&ctx);
+    }
+    if (ctx.record_streamer_ready) {
+        child_close_record_segment(&ctx, 0);
     }
 
     if (ctx.store_ready) {

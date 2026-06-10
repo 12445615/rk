@@ -119,7 +119,7 @@ static int video_uploader_http_json_extract_string(const char *json,
         return EINVAL;
     }
 
-    rc = snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    rc = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     if (rc < 0 || (size_t)rc >= sizeof(pattern)) {
         return ENAMETOOLONG;
     }
@@ -130,6 +130,22 @@ static int video_uploader_http_json_extract_string(const char *json,
     }
 
     value_start = start + strlen(pattern);
+    while (*value_start == ' ' || *value_start == '\t' ||
+           *value_start == '\r' || *value_start == '\n') {
+        value_start++;
+    }
+    if (*value_start != ':') {
+        return EINVAL;
+    }
+    value_start++;
+    while (*value_start == ' ' || *value_start == '\t' ||
+           *value_start == '\r' || *value_start == '\n') {
+        value_start++;
+    }
+    if (*value_start != '"') {
+        return EINVAL;
+    }
+    value_start++;
     value_end = strchr(value_start, '"');
     if (value_end == NULL) {
         return EINVAL;
@@ -159,7 +175,7 @@ static int video_uploader_http_json_extract_int(const char *json,
         return EINVAL;
     }
 
-    rc = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    rc = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     if (rc < 0 || (size_t)rc >= sizeof(pattern)) {
         return ENAMETOOLONG;
     }
@@ -170,6 +186,18 @@ static int video_uploader_http_json_extract_int(const char *json,
     }
 
     value_start = start + strlen(pattern);
+    while (*value_start == ' ' || *value_start == '\t' ||
+           *value_start == '\r' || *value_start == '\n') {
+        value_start++;
+    }
+    if (*value_start != ':') {
+        return EINVAL;
+    }
+    value_start++;
+    while (*value_start == ' ' || *value_start == '\t' ||
+           *value_start == '\r' || *value_start == '\n') {
+        value_start++;
+    }
     errno = 0;
     value = strtol(value_start, &endptr, 10);
     if (errno != 0 || endptr == value_start) {
@@ -360,6 +388,15 @@ static int video_uploader_handle_one(VideoUploader *uploader) {
                    (long long)segment.id,
                    segment.file_path,
                    remote_path);
+            if (unlink(segment.file_path) == 0) {
+                printf("[VideoUploader] Deleted uploaded local segment: %s\n",
+                       segment.file_path);
+            } else {
+                fprintf(stderr,
+                        "[VideoUploader] Uploaded but failed to delete local segment %s: %s\n",
+                        segment.file_path,
+                        strerror(errno));
+            }
         }
         return rc;
     }

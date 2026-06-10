@@ -133,6 +133,7 @@ static uint16_t safety_expected_flags_from_code(uint8_t code) {
     case SAFETY_CODE_PPE_DENY:
     case SAFETY_CODE_INTRUSION:
     case SAFETY_CODE_FAULT:
+    case SAFETY_CODE_EMERGENCY_ACK:
     default:
         return SAFETY_ACT_ALARM_ON;
     }
@@ -179,35 +180,29 @@ static void safety_handle_stm32_code(SafetyInterlockClient *client,
         break;
     case SAFETY_STM32_CODE_INTERLOCK:
         flags |= SAFETY_ACT_INTERLOCK;
-        client->snapshot.last_event_type = code;
-        break;
-    case SAFETY_STM32_CODE_ENV_DANGER:
+        flags |= SAFETY_ACT_ALARM_ON;
         client->snapshot.last_event_type = code;
         break;
     case SAFETY_STM32_CODE_EMERGENCY_STOP:
+        flags |= SAFETY_ACT_ALARM_ON;
         client->snapshot.last_event_type = code;
         break;
     case SAFETY_STM32_CODE_FAULT:
+        flags |= SAFETY_ACT_ALARM_ON;
         client->snapshot.fault_code = 1;
         client->snapshot.last_fault_code = code;
         client->snapshot.last_event_type = code;
         break;
     case SAFETY_STM32_CODE_RESET_WAIT:
         flags |= SAFETY_ACT_RESET_WAIT;
+        flags |= SAFETY_ACT_ALARM_ON;
         client->snapshot.last_event_type = code;
         break;
     case SAFETY_STM32_CODE_RESET_OK:
         client->snapshot.fault_code = 0;
-        client->snapshot.last_event_type = code;
-        break;
-    case SAFETY_STM32_CODE_FAN_ON:
-        flags |= SAFETY_ACT_FAN_ON;
-        break;
-    case SAFETY_STM32_CODE_ALARM_ON:
-        flags |= SAFETY_ACT_ALARM_ON;
-        break;
-    case SAFETY_STM32_CODE_START_REQUEST:
-    case SAFETY_STM32_CODE_RESET_REQUEST:
+        client->snapshot.actuator_flags &= (uint16_t)~(SAFETY_ACT_ALARM_ON |
+                                                       SAFETY_ACT_INTERLOCK |
+                                                       SAFETY_ACT_RESET_WAIT);
         client->snapshot.last_event_type = code;
         break;
     default:
@@ -505,6 +500,9 @@ static uint8_t safety_fusion_to_simple_code(uint8_t permit_decision,
     }
     if (risk_type == SAFETY_RISK_TYPE_ENV) {
         return SAFETY_CODE_ENV_DANGER;
+    }
+    if (risk_type == SAFETY_RISK_TYPE_EMERGENCY_STOP) {
+        return SAFETY_CODE_EMERGENCY_ACK;
     }
     if (risk_type == SAFETY_RISK_TYPE_STM32_FAULT) {
         return SAFETY_CODE_FAULT;

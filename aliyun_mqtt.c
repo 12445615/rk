@@ -60,13 +60,13 @@
 
 #define ADDRESS "tcp://iot-06z00be8pk7p1uz.mqtt.iothub.aliyuncs.com:1883"
 
-#define CLIENTID "k29ovUMboAH.0122-qt|securemode=2,signmethod=hmacsha256,timestamp=1780814592285|"
+#define CLIENTID "k29ovUMboAH.0122|securemode=2,signmethod=hmacsha256,timestamp=1781166423351|"
 
-#define USERNAME "0122-qt&k29ovUMboAH"
+#define USERNAME "0122&k29ovUMboAH"
 
-#define PASSWORD "13d2a39a934093962c3cb257db438e3b69a400c28f4267ff2ce5b0cf9d9f059a"
+#define PASSWORD "db3c4187b154d863a52a7eafd0e44ad7e094fd9704d571dfdbfa10278ed07073"
 
-#define TOPIC "/sys/k29ovUMboAH/0122-qt/thing/event/property/post"
+#define TOPIC "/sys/k29ovUMboAH/0122/thing/event/property/post"
 
 #define MQTT_REPORT_INTERVAL_SEC 10
 
@@ -81,8 +81,6 @@ typedef struct {
     int ppm;
 
     float temp;
-
-    float humi;
 
     int alarm_status;
 
@@ -161,8 +159,6 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
 
     snapshot->temp = g_sensor_data.temp;
 
-    snapshot->humi = g_sensor_data.humi;
-
     snapshot->alarm_status = g_sensor_data.alarm_status;
 
     pthread_mutex_unlock(&g_sensor_data.lock);
@@ -233,8 +229,6 @@ static void build_debug_snapshot(SensorSnapshot *snapshot, int seq) {
 
     snapshot->temp = 25.5f + (float)seq * 0.1f;
 
-    snapshot->humi = 60.0f + (float)seq * 0.2f;
-
     snapshot->alarm_status = seq % 2;
 
     snapshot->power_switch = snapshot->alarm_status ? 0 : 1;
@@ -287,9 +281,6 @@ static int build_sensor_payload(char *payload,
                        "\"AlarmState\":%d,"
 
                        "\"smokeconcentration\":%.2f,"
-
-                       "\"Humidity\":%.2f,"
-
                        "\"temperature\":%.2f,"
 
                        "\"AiDetectState\":%d"
@@ -311,9 +302,6 @@ static int build_sensor_payload(char *payload,
                        alarm_state,
 
                        (double)snapshot->smoke_concentration,
-
-                       (double)snapshot->humi,
-
                        (double)snapshot->temp,
                        ai_detect_state);
     g_last_reported_ai_state = ai_detect_state;
@@ -465,7 +453,7 @@ static int enqueue_offline_record(LocalStore *store,
 
                              snapshot->temp,
 
-                             snapshot->humi,
+                             0.0,
 
                              snapshot->alarm_status,
 
@@ -1233,8 +1221,6 @@ void stop_mqtt_reporter(void) {
 
 void mqtt_request_immediate_ai_report(uint8_t ai_detect_state) {
 
-    uint64_t one = 1;
-
     if (ai_detect_state == 0) {
 
         return;
@@ -1245,6 +1231,13 @@ void mqtt_request_immediate_ai_report(uint8_t ai_detect_state) {
     g_immediate_ai_valid = 1;
     g_immediate_ai_state = ai_detect_state;
     pthread_mutex_unlock(&g_immediate_ai_lock);
+
+    mqtt_request_immediate_report();
+}
+
+void mqtt_request_immediate_report(void) {
+
+    uint64_t one = 1;
 
     if (!g_mqtt_started || g_mqtt_wakeup_fd < 0) {
 

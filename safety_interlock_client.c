@@ -160,9 +160,7 @@ static void safety_handle_stm32_code(SafetyInterlockClient *client,
 
     switch (code) {
     case SAFETY_STM32_CODE_SAFE:
-        client->snapshot.work_state = 0;
         client->snapshot.fault_code = 0;
-        client->snapshot.actuator_flags = 0;
         break;
     case SAFETY_STM32_CODE_WORKING:
         client->snapshot.work_state = 1;

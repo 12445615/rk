@@ -77,10 +77,10 @@
 #define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
 #define SAFETY_WORK_ZONE_DEFAULT "520,220,880,560"
 #define SAFETY_DANGER_ZONE_DEFAULT "160,120,1040,640"
-#define SAFETY_SMOKE_HIGH_DEFAULT 600
-#define SAFETY_GAS_HIGH_DEFAULT 500
+#define SAFETY_SMOKE_HIGH_DEFAULT 70
+#define SAFETY_GAS_HIGH_DEFAULT 3000
 #define SAFETY_TEMP_HIGH_X10_DEFAULT 600
-#define SAFETY_SMOKE_RISE_DEFAULT 50
+#define SAFETY_SMOKE_RISE_DEFAULT 20
 #define SAFETY_TEMP_RISE_X10_DEFAULT 30
 #define SAFETY_AI_FLAG_VALID       (1u << 0)
 #define SAFETY_AI_FLAG_PPE_OK      (1u << 1)
@@ -1938,6 +1938,8 @@ int main(void) {
     uint64_t stream_failures = 0;
     int64_t last_video_stats_ms = 0;
     int64_t last_sensor_lock_ms = 0;
+    int last_actuator_report_valid = 0;
+    uint16_t last_actuator_report_flags = 0;
 
     memset(&video_uploader, 0, sizeof(video_uploader));
     memset(&ai_pipeline, 0, sizeof(ai_pipeline));
@@ -2129,6 +2131,21 @@ int main(void) {
                                   detect_state,
                                   frame_wall_ms,
                                   frame_mono_ms);
+            SafetyStm32Snapshot stm32_snapshot;
+            if (safety_client_get_snapshot(&safety_client, &stm32_snapshot) == 0 &&
+                stm32_snapshot.actuator_feedback_valid) {
+                uint16_t actuator_flags =
+                    (uint16_t)(stm32_snapshot.actuator_flags &
+                               (SAFETY_ACT_DEVICE_POWER_ON |
+                                SAFETY_ACT_FAN_ON |
+                                SAFETY_ACT_ALARM_ON));
+                if (!last_actuator_report_valid ||
+                    actuator_flags != last_actuator_report_flags) {
+                    last_actuator_report_valid = 1;
+                    last_actuator_report_flags = actuator_flags;
+                    mqtt_request_immediate_report();
+                }
+            }
         }
 
         if (last_video_stats_ms == 0) {

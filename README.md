@@ -737,3 +737,89 @@ make video_uploader_debug
 还需要继续完善的能力：
 
 - 服务端鉴权、存储、检索方案按实际部署继续收敛
+## 2026-06-15 备份分支说明
+
+分支：`backup-rk-zone-control-20260615`
+
+本分支是当前 RK3588 端代码备份，主要包含 MQTT 通信、安全联锁、录像上传、工作区/危险区视觉识别和区域框绘制相关改动。
+
+### 主要改动
+
+- 新增 `zone_detector.c` / `zone_detector.h`，用于识别摄像头画面中的蓝色工作区边框和红色危险区边框。
+- 区域识别成功后会锁定结果，不再持续移动或重复识别；只有收到 Qt 的重新识别命令后才会清空并重新识别。
+- 区域识别算法改为按颜色连通组件筛选，只取最像矩形边框的蓝色/红色组件，避免画面中的杂色把框拉大。
+- 红色危险区必须位于蓝色工作区内部，否则不认为区域划分成功。
+- 编码进程支持在没有 AI 目标框时仍然绘制区域框，解决 `boxes=0` 时识别成功但画面不显示蓝框/红框的问题。
+- MQTT topic 按阿里云默认自定义 Topic 权限调整：
+  - RK 发布：`/k29ovUMboAH/0122/user/update`
+  - RK 订阅：`/k29ovUMboAH/0122/user/get`
+- 支持 Qt 下发 `zone_redetect_request`，RK 收到后重新进行区域识别。
+- 区域识别结果通过 MQTT 上报 `zone_detect_result`，`ok=1` 表示识别成功，`ok=0` 表示未识别成功。
+- 保留并整理 STM32/RK 安全联锁通信、火灾/急停/故障/人工复位等处理逻辑。
+- 保存视频片段、离线上传补发、上传成功后删除本地录像等逻辑保留。
+
+### 运行方式
+
+在板子上运行：
+
+```bash
+cd /root
+./main
+```
+
+正常识别到区域时会看到类似日志：
+
+```text
+[ZoneDetect] locked blue work=[...] red danger=[...]
+[Aliyun] zone result published ok=1 topic=/k29ovUMboAH/0122/user/update
+```
+
+点击 Qt 上位机的“是否重新自动识别”后，RK 会收到：
+
+```text
+[ZoneDetect] reset, waiting for fresh blue/red zone detection
+```
+
+随后重新识别，成功后再次打印 `locked blue work=... red danger=...`。
+
+### 和 Qt 的区域控制通信
+
+Qt 发布命令到：
+
+```text
+/k29ovUMboAH/0122-qt/user/update
+```
+
+阿里云云产品流转转发到 RK：
+
+```text
+/k29ovUMboAH/0122/user/get
+```
+
+RK 发布心跳和区域结果到：
+
+```text
+/k29ovUMboAH/0122/user/update
+```
+
+阿里云云产品流转转发到 Qt：
+
+```text
+/k29ovUMboAH/0122-qt/user/get
+```
+
+### 关键文件
+
+- `main.c`：主流程、AI 状态、安全融合、父子进程视频流处理。
+- `zone_detector.c/.h`：蓝色工作区和红色危险区视觉识别、锁定、重置。
+- `aliyun_mqtt.c/.h`：阿里云 MQTT 上报、订阅、区域控制命令处理。
+- `encoder.c`：视频编码和画面叠加，包含区域框绘制。
+- `detect_shared.h`：父子进程共享的 AI/区域检测状态。
+- `deploy_main_once.exp`：将编译出的 `main` 上传到板子的部署脚本。
+
+### 注意事项
+
+- 区域框识别依赖摄像头画面中实际画出的蓝色/红色边框，光照太暗、反光、边框断裂过多都会影响识别。
+- 当前识别成功后会锁定区域，不会自动更新位置；如果重新画了框，需要在 Qt 点击“是否重新自动识别”。
+- RK 和 Qt 不能使用相同 MQTT `clientId`，否则会互相顶掉连接。
+- `SENSOR_MODBUS_DISABLE=1` 表示 RK 端跳过本地 Modbus 传感器采集，当前传感器数据主要按 STM32 串口/MQTT 逻辑走。

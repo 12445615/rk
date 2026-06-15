@@ -15,11 +15,22 @@ typedef struct {
 } DetectBox;
 
 typedef struct {
+    int valid;
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+} DetectZoneRect;
+
+typedef struct {
     uint32_t version;
     int valid;
     int box_count;
     int64_t frame_seq;
     int64_t timestamp_ms;
+    int zone_valid;
+    DetectZoneRect work_zone;
+    DetectZoneRect danger_zone;
     DetectBox boxes[DETECT_MAX_BOXES];
 } DetectSharedState;
 

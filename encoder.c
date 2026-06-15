@@ -29,13 +29,6 @@
 
 
 #define ALIGN_TO_2(x) ((x + 1) & ~1)
-#define SAFETY_WORK_ZONE_ENV "SAFETY_WORK_ZONE"
-#define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
-#define SAFETY_WORK_ZONE_DEFAULT "520,220,880,560"
-#define SAFETY_DANGER_ZONE_DEFAULT "160,120,1040,640"
-
-
-
 static int64_t get_mono_time_ms(void) {
 
     struct timespec ts;
@@ -447,58 +440,9 @@ static void nv12_draw_stamp_luma(FFmpegStreamer *s,
     }
 }
 
-typedef struct {
-    int valid;
-    int x1;
-    int y1;
-    int x2;
-    int y2;
-} OverlayZoneRect;
-
-static int parse_overlay_zone_rect(const char *env_name, OverlayZoneRect *rect) {
-    const char *value;
-    float x1, y1, x2, y2;
-    char tail;
-
-    if (rect == NULL) {
-        return 0;
-    }
-
-    rect->valid = 0;
-    rect->x1 = 0;
-    rect->y1 = 0;
-    rect->x2 = 0;
-    rect->y2 = 0;
-
-    value = getenv(env_name);
-    if (value == NULL || value[0] == '\0') {
-        if (strcmp(env_name, SAFETY_WORK_ZONE_ENV) == 0) {
-            value = SAFETY_WORK_ZONE_DEFAULT;
-        } else if (strcmp(env_name, SAFETY_DANGER_ZONE_ENV) == 0) {
-            value = SAFETY_DANGER_ZONE_DEFAULT;
-        } else {
-            return 0;
-        }
-    }
-
-    if (sscanf(value, " %f , %f , %f , %f %c", &x1, &y1, &x2, &y2, &tail) != 4) {
-        return 0;
-    }
-    if (x2 <= x1 || y2 <= y1) {
-        return 0;
-    }
-
-    rect->valid = 1;
-    rect->x1 = (int)(x1 + 0.5f);
-    rect->y1 = (int)(y1 + 0.5f);
-    rect->x2 = (int)(x2 + 0.5f);
-    rect->y2 = (int)(y2 + 0.5f);
-    return 1;
-}
-
 static void draw_overlay_zone_rect(FFmpegStreamer *s,
                                    rga_buffer_t dst,
-                                   const OverlayZoneRect *zone,
+                                   const DetectZoneRect *zone,
                                    int border,
                                    unsigned int color) {
     int x1;
@@ -514,10 +458,10 @@ static void draw_overlay_zone_rect(FFmpegStreamer *s,
         return;
     }
 
-    x1 = clamp_int(zone->x1, 0, s->width - 2);
-    y1 = clamp_int(zone->y1, 0, s->height - 2);
-    x2 = clamp_int(zone->x2, x1 + border, s->width);
-    y2 = clamp_int(zone->y2, y1 + border, s->height);
+    x1 = clamp_int((int)(zone->x1 + 0.5f), 0, s->width - 2);
+    y1 = clamp_int((int)(zone->y1 + 0.5f), 0, s->height - 2);
+    x2 = clamp_int((int)(zone->x2 + 0.5f), x1 + border, s->width);
+    y2 = clamp_int((int)(zone->y2 + 0.5f), y1 + border, s->height);
 
     x1 = align_even_down(x1);
     y1 = align_even_down(y1);
@@ -544,15 +488,15 @@ static void draw_overlay_zone_rect(FFmpegStreamer *s,
     }
 }
 
-static void draw_safety_zones(FFmpegStreamer *s, rga_buffer_t dst) {
-    OverlayZoneRect work_zone;
-    OverlayZoneRect danger_zone;
+static void draw_detect_zones(FFmpegStreamer *s,
+                              rga_buffer_t dst,
+                              const DetectSharedState *detect_state) {
+    if (detect_state == NULL || !detect_state->zone_valid) {
+        return;
+    }
 
-    parse_overlay_zone_rect(SAFETY_DANGER_ZONE_ENV, &danger_zone);
-    parse_overlay_zone_rect(SAFETY_WORK_ZONE_ENV, &work_zone);
-
-    draw_overlay_zone_rect(s, dst, &danger_zone, 6, 0xff0000);
-    draw_overlay_zone_rect(s, dst, &work_zone, 4, 0x0000ff);
+    draw_overlay_zone_rect(s, dst, &detect_state->danger_zone, 6, 0xff0000);
+    draw_overlay_zone_rect(s, dst, &detect_state->work_zone, 4, 0x0000ff);
 }
 
 
@@ -577,7 +521,7 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
 
     dst.hstride = 768;
 
-    draw_safety_zones(s, dst);
+    draw_detect_zones(s, dst, detect_state);
 
     if (detect_state == NULL || !detect_state->valid || detect_state->box_count <= 0) return;
 

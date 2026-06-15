@@ -7,6 +7,7 @@
 #include "video_uploader.h"
 #include "rknn_worker.h"
 #include "safety_interlock_client.h"
+#include "zone_detector.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -31,7 +32,7 @@
 #include "audio_alert.h"//加入语音
 
 #define VIDEO_DEV "/dev/video11"
-#define RTMP_URL "rtmp://10.36.113.231:1935/fire_live/test"
+#define RTMP_URL "rtmp://10.139.8.231:1935/fire_live/test"
 #define WIDTH  1280
 #define HEIGHT 720
 #define BUF_COUNT 4
@@ -73,10 +74,6 @@
 #define SAFETY_TEMP_HIGH_X10_ENV "SAFETY_TEMP_HIGH_X10"
 #define SAFETY_SMOKE_RISE_ENV "SAFETY_SMOKE_RISE_DELTA"
 #define SAFETY_TEMP_RISE_X10_ENV "SAFETY_TEMP_RISE_X10_DELTA"
-#define SAFETY_WORK_ZONE_ENV "SAFETY_WORK_ZONE"
-#define SAFETY_DANGER_ZONE_ENV "SAFETY_DANGER_ZONE"
-#define SAFETY_WORK_ZONE_DEFAULT "520,220,880,560"
-#define SAFETY_DANGER_ZONE_DEFAULT "160,120,1040,640"
 #define SAFETY_SMOKE_HIGH_DEFAULT 70
 #define SAFETY_GAS_HIGH_DEFAULT 3000
 #define SAFETY_TEMP_HIGH_X10_DEFAULT 600
@@ -613,6 +610,33 @@ static int detect_snapshot_read(DetectSharedState *shared, DetectSharedState *sn
     return 0;
 }
 
+static int detect_snapshot_read_overlay(DetectSharedState *shared, DetectSharedState *snapshot) {
+    uint32_t before;
+    uint32_t after;
+    int tries;
+
+    if (shared == NULL || snapshot == NULL || (!shared->valid && !shared->zone_valid)) {
+        return 0;
+    }
+
+    for (tries = 0; tries < 3; tries++) {
+        before = shared->version;
+        if ((before & 1U) != 0U) {
+            continue;
+        }
+        __sync_synchronize();
+        memcpy(snapshot, shared, sizeof(*snapshot));
+        __sync_synchronize();
+        after = shared->version;
+        if (before == after && (after & 1U) == 0U &&
+            (snapshot->valid || snapshot->zone_valid)) {
+            return snapshot->box_count > 0 || snapshot->zone_valid;
+        }
+    }
+
+    return 0;
+}
+
 typedef struct {
     uint16_t ai_flags;
     uint8_t ai_confidence;
@@ -645,14 +669,6 @@ typedef struct {
     int initialized;
 } SafetyRuntimeState;
 
-typedef struct {
-    int valid;
-    float x1;
-    float y1;
-    float x2;
-    float y2;
-} SafetyZoneRect;
-
 static uint8_t safety_score_to_percent(float score) {
     if (score <= 0.0f) {
         return 0;
@@ -663,61 +679,8 @@ static uint8_t safety_score_to_percent(float score) {
     return (uint8_t)(score * 100.0f + 0.5f);
 }
 
-static int safety_parse_zone_rect(const char *env_name, SafetyZoneRect *rect) {
-    const char *value;
-    char *endptr = NULL;
-    float x1, y1, x2, y2;
 
-    if (rect == NULL) {
-        return 0;
-    }
-
-    rect->valid = 0;
-    rect->x1 = 0.0f;
-    rect->y1 = 0.0f;
-    rect->x2 = 0.0f;
-    rect->y2 = 0.0f;
-
-    value = getenv(env_name);
-    if (value == NULL || value[0] == '\0') {
-        if (strcmp(env_name, SAFETY_WORK_ZONE_ENV) == 0) {
-            value = SAFETY_WORK_ZONE_DEFAULT;
-        } else if (strcmp(env_name, SAFETY_DANGER_ZONE_ENV) == 0) {
-            value = SAFETY_DANGER_ZONE_DEFAULT;
-        } else {
-            return 0;
-        }
-    }
-
-    errno = 0;
-    x1 = strtof(value, &endptr);
-    if (errno != 0 || endptr == value || *endptr != ',') return 0;
-    value = endptr + 1;
-
-    errno = 0;
-    y1 = strtof(value, &endptr);
-    if (errno != 0 || endptr == value || *endptr != ',') return 0;
-    value = endptr + 1;
-
-    errno = 0;
-    x2 = strtof(value, &endptr);
-    if (errno != 0 || endptr == value || *endptr != ',') return 0;
-    value = endptr + 1;
-
-    errno = 0;
-    y2 = strtof(value, &endptr);
-    if (errno != 0 || endptr == value || *endptr != '\0') return 0;
-    if (x2 <= x1 || y2 <= y1) return 0;
-
-    rect->valid = 1;
-    rect->x1 = x1;
-    rect->y1 = y1;
-    rect->x2 = x2;
-    rect->y2 = y2;
-    return 1;
-}
-
-static int safety_box_center_in_zone(const DetectBox *box, const SafetyZoneRect *rect) {
+static int safety_box_center_in_zone(const DetectBox *box, const ZoneRect *rect) {
     float cx;
     float cy;
 
@@ -746,11 +709,15 @@ static void safety_build_ai_status(DetectSharedState *shared,
     int has_fire_in_work_zone = 0;
     int has_fire_out_of_work_zone = 0;
     int has_intrusion = 0;
-    SafetyZoneRect work_zone;
-    SafetyZoneRect danger_zone;
+    int dynamic_zone_detected;
+    ZoneRect work_zone;
+    ZoneRect danger_zone;
 
-    safety_parse_zone_rect(SAFETY_WORK_ZONE_ENV, &work_zone);
-    safety_parse_zone_rect(SAFETY_DANGER_ZONE_ENV, &danger_zone);
+    dynamic_zone_detected = zone_runtime_get_detected(&work_zone, &danger_zone);
+    if (!dynamic_zone_detected) {
+        memset(&work_zone, 0, sizeof(work_zone));
+        memset(&danger_zone, 0, sizeof(danger_zone));
+    }
 
     if (!detect_snapshot_read(shared, &snapshot) ||
         snapshot.timestamp_ms <= 0 ||
@@ -781,7 +748,8 @@ static void safety_build_ai_status(DetectSharedState *shared,
             has_person = 1;
             if (danger_zone.valid &&
                 safety_box_center_in_zone(&snapshot.boxes[i], &danger_zone) &&
-                !safety_box_center_in_zone(&snapshot.boxes[i], &work_zone)) {
+                (dynamic_zone_detected ||
+                 !safety_box_center_in_zone(&snapshot.boxes[i], &work_zone))) {
                 has_intrusion = 1;
             }
         } else if (strcmp(name, "fire") == 0) {
@@ -873,6 +841,9 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
     int intrusion = (ai_flags & SAFETY_AI_FLAG_INTRUSION) != 0;
     int stm32_online = stm32 != NULL && stm32->online;
     int reset_ok = stm32 != NULL && stm32->last_event_type == SAFETY_STM32_CODE_RESET_OK;
+    int zone_detected = zone_runtime_get_detected(NULL, NULL);
+    int zone_blocked = mqtt_get_zone_blocked();
+    int zone_confirm_enabled = mqtt_get_zone_confirm_enabled();
 
     *permit_decision = SAFETY_PERMIT_DENY;
     *risk_level = SAFETY_RISK_WARNING;
@@ -939,6 +910,17 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
             state->suppress_fusion_send = 1;
         }
         return;
+    }
+
+    if (!zone_detected) {
+        if (zone_blocked || !zone_confirm_enabled) {
+            *risk_level = SAFETY_RISK_DANGER;
+            *risk_type = SAFETY_RISK_TYPE_NONE;
+            *voice_action = SAFETY_VOICE_NONE;
+            *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+            *explain_code = 90;
+            return;
+        }
     }
 
     if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
@@ -1135,8 +1117,7 @@ static uint8_t safety_ai_flags_to_detect_state(uint16_t ai_flags) {
 }
 
 static int safety_work_zone_configured(void) {
-    const char *value = getenv(SAFETY_WORK_ZONE_ENV);
-    return (value != NULL && value[0] != '\0') || SAFETY_WORK_ZONE_DEFAULT[0] != '\0';
+    return zone_runtime_get_detected(NULL, NULL);
 }
 
 static void safety_audio_update_from_fusion(const SafetyRuntimeState *state,
@@ -1754,7 +1735,7 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
 
         frame_mono_ms = mono_now_ms();
         frame_wall_ms = wall_now_ms();
-        if (detect_snapshot_read(ctx.detect_state, &ctx.detect_snapshot)) {
+        if (detect_snapshot_read_overlay(ctx.detect_state, &ctx.detect_snapshot)) {
             overlay = &ctx.detect_snapshot;
         }
 
@@ -2100,6 +2081,7 @@ int main(void) {
         frame_wall_ms = wall_now_ms();
         frame_mono_ms = mono_now_ms();
         capture_frames++;
+        zone_runtime_scan_frame(&cam, qbuf.index, frame_mono_ms, detect_state);
 
         if (stream.stream_online) {
             if (send_fd(stream.parent_sock, current_dma_fd) < 0) {

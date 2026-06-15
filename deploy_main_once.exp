@@ -1,0 +1,12 @@
+#!/usr/bin/expect -f
+set timeout 60
+spawn scp -o StrictHostKeyChecking=no /home/why/rk3588/rkproject/ELF2-feature-ai_project/0602/main root@10.36.113.52:/root/main
+expect {
+    -re "(?i)password:" { send "root\r"; exp_continue }
+    eof
+}
+spawn ssh -o StrictHostKeyChecking=no root@10.36.113.52 "chmod +x /root/main && ls -lh /root/main"
+expect {
+    -re "(?i)password:" { send "root\r"; exp_continue }
+    eof
+}

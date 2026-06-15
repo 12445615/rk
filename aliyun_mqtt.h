@@ -8,6 +8,9 @@ void stop_mqtt_reporter(void);
 void set_mqtt_safety_client(SafetyInterlockClient *client);
 void mqtt_request_immediate_report(void);
 void mqtt_request_immediate_ai_report(uint8_t ai_detect_state);
+int mqtt_get_zone_confirm_enabled(void);
+int mqtt_get_zone_blocked(void);
+void mqtt_update_zone_detection_result(int ok);
 
 int mqtt_debug_set_force_offline(int enabled);
 int mqtt_debug_enqueue_fake_record(const char *root_dir, const char *payload);

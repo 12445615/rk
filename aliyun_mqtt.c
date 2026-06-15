@@ -1,4 +1,4 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 
 #include <stdlib.h>
 
@@ -25,6 +25,8 @@
 #include "sensor_modbus.h"
 
 #include "aliyun_mqtt.h"
+
+void zone_runtime_reset(void);
 
 #include "local_store.h"
 
@@ -68,11 +70,19 @@
 
 #define TOPIC "/sys/k29ovUMboAH/0122/thing/event/property/post"
 
+#define ZONE_CONTROL_TOPIC "/k29ovUMboAH/0122/user/get"
+
+#define HEARTBEAT_TOPIC "/k29ovUMboAH/0122/user/update"
+
+#define ZONE_RESULT_TOPIC "/k29ovUMboAH/0122/user/update"
+
 #define MQTT_REPORT_INTERVAL_SEC 10
 
 #define MQTT_OFFLINE_FLUSH_BATCH 10
 
 #define MQTT_AI_NONE_REPORT_INTERVAL_MS 60000
+
+#define MQTT_ZONE_STATUS_REPEAT_MS 10000
 
 
 
@@ -127,6 +137,20 @@ static int g_immediate_ai_valid = 0;
 
 static int g_immediate_ai_state = 0;
 
+static pthread_mutex_t g_zone_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int g_zone_confirm_enabled = 0;
+
+static int g_zone_blocked = 0;
+
+static int g_zone_detect_request_pending = 0;
+
+static int g_zone_detect_ok = 0;
+
+static int64_t g_zone_last_cmd_ms = 0;
+
+static int64_t g_zone_last_publish_request_ms = 0;
+
 
 
 static int64_t current_time_ms(void) {
@@ -145,6 +169,94 @@ static int64_t current_time_ms(void) {
 
     return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 
+}
+
+static int payload_contains(const char *payload, const char *needle) {
+    return payload != NULL && needle != NULL && strstr(payload, needle) != NULL;
+}
+
+static void mqtt_wakeup_reporter_internal(void) {
+    uint64_t one = 1;
+
+    if (!g_mqtt_started || g_mqtt_wakeup_fd < 0) {
+        return;
+    }
+
+    if (write(g_mqtt_wakeup_fd, &one, sizeof(one)) < 0 &&
+        errno != EAGAIN) {
+        perror("mqtt wake eventfd write");
+    }
+}
+
+static void handle_zone_control_payload(const char *payload) {
+    int confirm_enabled = 0;
+    int blocked = 0;
+    int detect_request = 0;
+    int redetect_request = 0;
+
+    if (payload_contains(payload, "zone_confirm_yes")) {
+        confirm_enabled = 1;
+        blocked = 0;
+    } else if (payload_contains(payload, "zone_confirm_no") ||
+               payload_contains(payload, "zone_timeout")) {
+        confirm_enabled = 0;
+        blocked = 1;
+    } else if (payload_contains(payload, "zone_redetect_request")) {
+        detect_request = 1;
+        redetect_request = 1;
+    } else if (payload_contains(payload, "zone_detect_request")) {
+        detect_request = 1;
+    } else if (payload_contains(payload, "zone_need_confirm")) {
+        confirm_enabled = 0;
+        blocked = 0;
+    }
+
+    pthread_mutex_lock(&g_zone_lock);
+    if (payload_contains(payload, "zone_confirm_yes") ||
+        payload_contains(payload, "zone_confirm_no") ||
+        payload_contains(payload, "zone_timeout") ||
+        payload_contains(payload, "zone_need_confirm")) {
+        g_zone_confirm_enabled = confirm_enabled;
+        g_zone_blocked = blocked;
+    }
+    if (detect_request) {
+        g_zone_detect_request_pending = 1;
+    }
+    g_zone_last_cmd_ms = current_time_ms();
+    pthread_mutex_unlock(&g_zone_lock);
+
+    if (redetect_request) {
+        zone_runtime_reset();
+    }
+
+    printf("[Aliyun] zone_control received: %s\n", payload ? payload : "");
+    mqtt_wakeup_reporter_internal();
+}
+
+static int mqtt_message_arrived(void *context,
+                                char *topic_name,
+                                int topic_len,
+                                MQTTClient_message *message) {
+    (void)context;
+    (void)topic_len;
+
+    if (topic_name != NULL && message != NULL && message->payload != NULL) {
+        char payload[512];
+        int copy_len = message->payloadlen;
+        if (copy_len >= (int)sizeof(payload)) {
+            copy_len = (int)sizeof(payload) - 1;
+        }
+        memcpy(payload, message->payload, (size_t)copy_len);
+        payload[copy_len] = '\0';
+
+        if (strcmp(topic_name, ZONE_CONTROL_TOPIC) == 0) {
+            handle_zone_control_payload(payload);
+        }
+    }
+
+    MQTTClient_freeMessage(&message);
+    MQTTClient_free(topic_name);
+    return 1;
 }
 
 
@@ -308,7 +420,7 @@ static int build_sensor_payload(char *payload,
     if (ai_detect_state == 0) {
         g_last_ai_none_report_ms = created_at_ms;
     } else {
-        printf("[阿里云] AiDetectState=%d will be reported\n", ai_detect_state);
+        printf("[闃块噷浜慮 AiDetectState=%d will be reported\n", ai_detect_state);
     }
 
 
@@ -387,7 +499,14 @@ static int mqtt_connect_client(MQTTClient client) {
 
     if (rc == MQTTCLIENT_SUCCESS) {
 
-        printf("[阿里云] 已连接，开始上传并补发离线数据。\n");
+        printf("[闃块噷浜慮 宸茶繛鎺ワ紝寮€濮嬩笂浼犲苟琛ュ彂绂荤嚎鏁版嵁銆俓n");
+
+        rc = MQTTClient_subscribe(client, ZONE_CONTROL_TOPIC, 0);
+        if (rc == MQTTCLIENT_SUCCESS) {
+            printf("[Aliyun] subscribed topic=%s\n", ZONE_CONTROL_TOPIC);
+        } else {
+            printf("[Aliyun] subscribe failed topic=%s rc=%d\n", ZONE_CONTROL_TOPIC, rc);
+        }
 
         return 0;
 
@@ -395,7 +514,7 @@ static int mqtt_connect_client(MQTTClient client) {
 
 
 
-    printf("[阿里云错误] 连接失败，返回码: %d\n", rc);
+    printf("[闃块噷浜戦敊璇痌 杩炴帴澶辫触锛岃繑鍥炵爜: %d\n", rc);
 
     return rc;
 
@@ -433,7 +552,7 @@ static int enqueue_offline_record(LocalStore *store,
 
     if (!store_ready) {
 
-        fprintf(stderr, "[离线缓存] 不可用，当前数据无法落盘。\n");
+        fprintf(stderr, "[绂荤嚎缂撳瓨] 涓嶅彲鐢紝褰撳墠鏁版嵁鏃犳硶钀界洏銆俓n");
 
         return ENOSYS;
 
@@ -463,7 +582,7 @@ static int enqueue_offline_record(LocalStore *store,
 
     if (rc != 0) {
 
-        fprintf(stderr, "[离线缓存] 写入失败: %d\n", rc);
+        fprintf(stderr, "[绂荤嚎缂撳瓨] 鍐欏叆澶辫触: %d\n", rc);
 
         return rc;
 
@@ -471,7 +590,7 @@ static int enqueue_offline_record(LocalStore *store,
 
 
 
-    printf("[离线缓存] 已保存一条离线记录。\n");
+    printf("[绂荤嚎缂撳瓨] 宸蹭繚瀛樹竴鏉＄绾胯褰曘€俓n");
 
     return 0;
 
@@ -493,7 +612,7 @@ static int flush_offline_records(LocalStore *store, MQTTClient client) {
 
     if (rc != 0) {
 
-        fprintf(stderr, "[离线缓存] 读取待补发记录失败: %d\n", rc);
+        fprintf(stderr, "[绂荤嚎缂撳瓨] 璇诲彇寰呰ˉ鍙戣褰曞け璐? %d\n", rc);
 
         return 0;
 
@@ -507,7 +626,7 @@ static int flush_offline_records(LocalStore *store, MQTTClient client) {
 
         if (rc != MQTTCLIENT_SUCCESS) {
 
-            printf("[离线补发] 补发失败，返回码: %d\n", rc);
+            printf("[绂荤嚎琛ュ彂] 琛ュ彂澶辫触锛岃繑鍥炵爜: %d\n", rc);
 
             return -1;
 
@@ -519,7 +638,7 @@ static int flush_offline_records(LocalStore *store, MQTTClient client) {
 
         if (rc != 0) {
 
-            fprintf(stderr, "[离线缓存] 删除已补发记录失败 id=%lld, err=%d\n",
+            fprintf(stderr, "[绂荤嚎缂撳瓨] 鍒犻櫎宸茶ˉ鍙戣褰曞け璐?id=%lld, err=%d\n",
 
                     (long long)records[i].id, rc);
 
@@ -529,7 +648,7 @@ static int flush_offline_records(LocalStore *store, MQTTClient client) {
 
 
 
-        printf("[离线补发] 成功补发 id=%lld\n", (long long)records[i].id);
+        printf("[绂荤嚎琛ュ彂] 鎴愬姛琛ュ彂 id=%lld\n", (long long)records[i].id);
 
     }
 
@@ -563,7 +682,7 @@ static int send_or_enqueue_payload(LocalStore *store,
 
     if (g_mqtt_force_offline) {
 
-        printf("[MQTTDebug] force_offline=1，当前消息直接写入离线缓存。\n");
+        printf("[MQTTDebug] force_offline=1锛屽綋鍓嶆秷鎭洿鎺ュ啓鍏ョ绾跨紦瀛樸€俓n");
 
         return enqueue_offline_record(store, store_ready, created_at_ms, snapshot, payload);
 
@@ -589,7 +708,7 @@ static int send_or_enqueue_payload(LocalStore *store,
 
         if (rc == MQTTCLIENT_SUCCESS) {
 
-           // printf("[阿里云] 当前数据上报成功。\n");
+           // printf("[闃块噷浜慮 褰撳墠鏁版嵁涓婃姤鎴愬姛銆俓n");
 
             return 0;
 
@@ -597,7 +716,7 @@ static int send_or_enqueue_payload(LocalStore *store,
 
 
 
-        printf("[阿里云错误] 当前数据上报失败，返回码: %d\n", rc);
+        printf("[闃块噷浜戦敊璇痌 褰撳墠鏁版嵁涓婃姤澶辫触锛岃繑鍥炵爜: %d\n", rc);
 
         mqtt_disconnect_client(client, mqtt_connected);
 
@@ -607,6 +726,86 @@ static int send_or_enqueue_payload(LocalStore *store,
 
     return enqueue_offline_record(store, store_ready, created_at_ms, snapshot, payload);
 
+}
+
+static void publish_heartbeat(MQTTClient client,
+                              int mqtt_connected,
+                              int64_t created_at_ms) {
+    SafetyStm32Snapshot stm32_snapshot;
+    int stm32_online = 0;
+    int rc;
+    char payload[256];
+
+    if (!mqtt_connected || client == NULL) {
+        return;
+    }
+
+    if (g_safety_client != NULL &&
+        safety_client_get_snapshot(g_safety_client, &stm32_snapshot) == 0) {
+        stm32_online = stm32_snapshot.online ? 1 : 0;
+    }
+
+    snprintf(payload, sizeof(payload),
+             "{\"cmd\":\"heartbeat\",\"online\":1,"
+             "\"stm32_online\":%d,\"ts\":%lld}",
+             stm32_online,
+             (long long)created_at_ms);
+
+    rc = publish_payload(client, HEARTBEAT_TOPIC, payload);
+    if (rc == MQTTCLIENT_SUCCESS) {
+        printf("[Aliyun] heartbeat published topic=%s stm32_online=%d\n",
+               HEARTBEAT_TOPIC,
+               stm32_online);
+    } else {
+        printf("[Aliyun] heartbeat publish failed topic=%s rc=%d\n",
+               HEARTBEAT_TOPIC,
+               rc);
+    }
+}
+
+static void publish_zone_detect_result_if_needed(MQTTClient client,
+                                                 int mqtt_connected,
+                                                 int64_t created_at_ms) {
+    int pending = 0;
+    char payload[256];
+
+    if (!mqtt_connected || client == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_zone_lock);
+    pending = g_zone_detect_request_pending;
+    g_zone_detect_request_pending = 0;
+    pthread_mutex_unlock(&g_zone_lock);
+
+    if (!pending) {
+        return;
+    }
+
+    int ok;
+
+    pthread_mutex_lock(&g_zone_lock);
+    ok = g_zone_detect_ok;
+    pthread_mutex_unlock(&g_zone_lock);
+
+    snprintf(payload, sizeof(payload),
+             "{\"cmd\":\"zone_detect_result\",\"ok\":%d,"
+             "\"msg\":\"%s\",\"ts\":%lld}",
+             ok,
+             ok ? "zone detected" : "zone not detected",
+             (long long)created_at_ms);
+
+    int rc = publish_payload(client, ZONE_RESULT_TOPIC, payload);
+    if (rc == MQTTCLIENT_SUCCESS) {
+        printf("[Aliyun] zone result published ok=%d topic=%s\n",
+               ok,
+               ZONE_RESULT_TOPIC);
+    } else {
+        printf("[Aliyun] zone result publish failed ok=%d topic=%s rc=%d\n",
+               ok,
+               ZONE_RESULT_TOPIC,
+               rc);
+    }
 }
 
 
@@ -753,7 +952,7 @@ static int mqtt_debug_flush_offline_once_internal(const char *root_dir) {
 
     if (g_mqtt_force_offline) {
 
-        printf("[MQTTDebug] force_offline=1，跳过补发。\n");
+        printf("[MQTTDebug] force_offline=1锛岃烦杩囪ˉ鍙戙€俓n");
 
         return 0;
 
@@ -855,7 +1054,7 @@ static void *mqtt_thread_func(void *arg) {
 
 
 
-    printf("[阿里云] MQTT 线程启动，准备连接...\n");
+    printf("[闃块噷浜慮 MQTT 绾跨▼鍚姩锛屽噯澶囪繛鎺?..\n");
 
 
 
@@ -863,13 +1062,13 @@ static void *mqtt_thread_func(void *arg) {
 
     if (rc != 0) {
 
-        fprintf(stderr, "[离线缓存] 初始化失败: %d\n", rc);
+        fprintf(stderr, "[绂荤嚎缂撳瓨] 鍒濆鍖栧け璐? %d\n", rc);
 
     } else {
 
         store_ready = 1;
 
-        printf("[离线缓存] SQLite 已就绪: %s\n", store.db_path);
+        printf("[绂荤嚎缂撳瓨] SQLite 宸插氨缁? %s\n", store.db_path);
 
     }
 
@@ -879,9 +1078,13 @@ static void *mqtt_thread_func(void *arg) {
 
     if (rc != MQTTCLIENT_SUCCESS) {
 
-        fprintf(stderr, "[阿里云错误] 创建客户端失败，返回码: %d\n", rc);
+        fprintf(stderr, "[闃块噷浜戦敊璇痌 鍒涘缓瀹㈡埛绔け璐ワ紝杩斿洖鐮? %d\n", rc);
 
         client = NULL;
+
+    } else {
+
+        MQTTClient_setCallbacks(client, NULL, NULL, mqtt_message_arrived, NULL);
 
     }
 
@@ -919,7 +1122,7 @@ static void *mqtt_thread_func(void *arg) {
 
 
 
-    printf("[阿里云] 定时上报已启动，每%d秒触发一次。\n", MQTT_REPORT_INTERVAL_SEC);
+    printf("[闃块噷浜慮 瀹氭椂涓婃姤宸插惎鍔紝姣?d绉掕Е鍙戜竴娆°€俓n", MQTT_REPORT_INTERVAL_SEC);
 
 
 
@@ -1026,7 +1229,7 @@ static void *mqtt_thread_func(void *arg) {
 
             if (rc != 0) {
 
-                fprintf(stderr, "[阿里云错误] 构造 payload 失败: %d\n", rc);
+                fprintf(stderr, "[闃块噷浜戦敊璇痌 鏋勯€?payload 澶辫触: %d\n", rc);
 
                 continue;
 
@@ -1052,7 +1255,7 @@ static void *mqtt_thread_func(void *arg) {
 
                 if (rc < 0) {
 
-                    printf("[阿里云] 补发过程中掉线，当前数据转入离线缓存。\n");
+                    printf("[闃块噷浜慮 琛ュ彂杩囩▼涓帀绾匡紝褰撳墠鏁版嵁杞叆绂荤嚎缂撳瓨銆俓n");
 
                     mqtt_disconnect_client(client, &mqtt_connected);
 
@@ -1080,8 +1283,15 @@ static void *mqtt_thread_func(void *arg) {
 
             if (rc != 0) {
 
-                fprintf(stderr, "[阿里云错误] 当前数据写入发送链路失败: %d\n", rc);
+                fprintf(stderr, "[闃块噷浜戦敊璇痌 褰撳墠鏁版嵁鍐欏叆鍙戦€侀摼璺け璐? %d\n", rc);
 
+            }
+
+            if (mqtt_connected) {
+                publish_heartbeat(client, mqtt_connected, created_at_ms);
+                publish_zone_detect_result_if_needed(client,
+                                                     mqtt_connected,
+                                                     created_at_ms);
             }
 
         }
@@ -1254,6 +1464,46 @@ void mqtt_request_immediate_report(void) {
 
 }
 
+void mqtt_update_zone_detection_result(int ok) {
+    int changed;
+    int64_t now_ms;
+    int should_publish = 0;
+
+    pthread_mutex_lock(&g_zone_lock);
+    ok = ok ? 1 : 0;
+    now_ms = current_time_ms();
+    changed = (g_zone_detect_ok != ok);
+    g_zone_detect_ok = ok;
+    if (changed ||
+        g_zone_last_publish_request_ms == 0 ||
+        now_ms - g_zone_last_publish_request_ms >= MQTT_ZONE_STATUS_REPEAT_MS) {
+        g_zone_detect_request_pending = 1;
+        g_zone_last_publish_request_ms = now_ms;
+        should_publish = 1;
+    }
+    pthread_mutex_unlock(&g_zone_lock);
+
+    if (should_publish) {
+        mqtt_wakeup_reporter_internal();
+    }
+}
+
+int mqtt_get_zone_confirm_enabled(void) {
+    int enabled;
+    pthread_mutex_lock(&g_zone_lock);
+    enabled = g_zone_confirm_enabled;
+    pthread_mutex_unlock(&g_zone_lock);
+    return enabled;
+}
+
+int mqtt_get_zone_blocked(void) {
+    int blocked;
+    pthread_mutex_lock(&g_zone_lock);
+    blocked = g_zone_blocked;
+    pthread_mutex_unlock(&g_zone_lock);
+    return blocked;
+}
+
 
 
 int mqtt_debug_set_force_offline(int enabled) {
@@ -1387,6 +1637,34 @@ void set_mqtt_safety_client(SafetyInterlockClient *client) {
 
 
 void stop_mqtt_reporter(void) {
+
+}
+
+void mqtt_request_immediate_report(void) {
+
+}
+
+void mqtt_request_immediate_ai_report(uint8_t ai_detect_state) {
+
+    (void)ai_detect_state;
+
+}
+
+void mqtt_update_zone_detection_result(int ok) {
+    pthread_mutex_lock(&g_zone_lock);
+    g_zone_detect_ok = ok ? 1 : 0;
+    pthread_mutex_unlock(&g_zone_lock);
+}
+
+int mqtt_get_zone_confirm_enabled(void) {
+
+    return 0;
+
+}
+
+int mqtt_get_zone_blocked(void) {
+
+    return 0;
 
 }
 

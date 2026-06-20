@@ -408,6 +408,59 @@ static void nv12_fill_rect(FFmpegStreamer *s,
     }
 }
 
+static void nv12_fill_rect_yuv(FFmpegStreamer *s,
+                               int x,
+                               int y,
+                               int width,
+                               int height,
+                               unsigned char y_value,
+                               unsigned char u_value,
+                               unsigned char v_value) {
+    int row;
+    int uv_row;
+    int uv_col;
+    int uv_x;
+    int uv_y;
+    int uv_w;
+    int uv_h;
+    unsigned char *y_plane;
+    unsigned char *uv_plane;
+
+    if (s == NULL || s->yuv_frame == NULL || s->yuv_frame->data[0] == NULL ||
+        width <= 0 || height <= 0) {
+        return;
+    }
+
+    x = clamp_int(x, 0, s->width);
+    y = clamp_int(y, 0, s->height);
+    width = clamp_int(width, 0, s->width - x);
+    height = clamp_int(height, 0, s->height - y);
+    if (width <= 0 || height <= 0) return;
+
+    y_plane = s->yuv_frame->data[0];
+    for (row = 0; row < height; row++) {
+        memset(y_plane + (y + row) * s->yuv_frame->linesize[0] + x, y_value, width);
+    }
+
+    uv_plane = s->yuv_frame->data[0] + s->yuv_frame->linesize[0] * 768;
+    uv_x = x & ~1;
+    uv_y = y & ~1;
+    uv_w = align_even_up(width + (x - uv_x));
+    uv_h = align_even_up(height + (y - uv_y)) / 2;
+    uv_w = clamp_int(uv_w, 0, s->width - uv_x);
+    if (uv_w <= 0 || uv_h <= 0) return;
+
+    for (uv_row = 0; uv_row < uv_h; uv_row++) {
+        unsigned char *row_ptr = uv_plane + (uv_y / 2 + uv_row) * s->yuv_frame->linesize[1] + uv_x;
+        for (uv_col = 0; uv_col < uv_w; uv_col += 2) {
+            row_ptr[uv_col] = u_value;
+            if (uv_col + 1 < uv_w) {
+                row_ptr[uv_col + 1] = v_value;
+            }
+        }
+    }
+}
+
 static void nv12_draw_stamp_luma(FFmpegStreamer *s,
                                  const GlyphStamp *stamp,
                                  int x,
@@ -488,20 +541,153 @@ static void draw_overlay_zone_rect(FFmpegStreamer *s,
     }
 }
 
-static void draw_detect_zones(FFmpegStreamer *s,
-                              rga_buffer_t dst,
-                              const DetectSharedState *detect_state) {
-    if (detect_state == NULL || !detect_state->zone_valid) {
+static void draw_nv12_line(FFmpegStreamer *s,
+                           int x0,
+                           int y0,
+                           int x1,
+                           int y1,
+                           int thickness,
+                           uint8_t y_value,
+                           uint8_t u_value,
+                           uint8_t v_value) {
+    int dx;
+    int dy;
+    int sx;
+    int sy;
+    int err;
+
+    if (s == NULL || thickness <= 0) {
         return;
     }
 
-    draw_overlay_zone_rect(s, dst, &detect_state->danger_zone, 6, 0xff0000);
-    draw_overlay_zone_rect(s, dst, &detect_state->work_zone, 4, 0x0000ff);
+    x0 = clamp_int(x0, 0, s->width - 1);
+    y0 = clamp_int(y0, 0, s->height - 1);
+    x1 = clamp_int(x1, 0, s->width - 1);
+    y1 = clamp_int(y1, 0, s->height - 1);
+
+    dx = abs(x1 - x0);
+    dy = -abs(y1 - y0);
+    sx = x0 < x1 ? 1 : -1;
+    sy = y0 < y1 ? 1 : -1;
+    err = dx + dy;
+
+    while (1) {
+        nv12_fill_rect_yuv(s,
+                           x0 - thickness / 2,
+                           y0 - thickness / 2,
+                           thickness,
+                           thickness,
+                           y_value,
+                           u_value,
+                           v_value);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        {
+            int e2 = 2 * err;
+            if (e2 >= dy) {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+}
+
+static void draw_overlay_zone_quad_red(FFmpegStreamer *s,
+                                       const DetectZoneRect *zone,
+                                       int thickness) {
+    if (s == NULL || zone == NULL || !zone->valid) {
+        return;
+    }
+
+    draw_nv12_line(s, (int)(zone->p0x + 0.5f), (int)(zone->p0y + 0.5f),
+                      (int)(zone->p1x + 0.5f), (int)(zone->p1y + 0.5f),
+                      thickness, 76, 84, 255);
+    draw_nv12_line(s, (int)(zone->p1x + 0.5f), (int)(zone->p1y + 0.5f),
+                      (int)(zone->p2x + 0.5f), (int)(zone->p2y + 0.5f),
+                      thickness, 76, 84, 255);
+    draw_nv12_line(s, (int)(zone->p2x + 0.5f), (int)(zone->p2y + 0.5f),
+                      (int)(zone->p3x + 0.5f), (int)(zone->p3y + 0.5f),
+                      thickness, 76, 84, 255);
+    draw_nv12_line(s, (int)(zone->p3x + 0.5f), (int)(zone->p3y + 0.5f),
+                      (int)(zone->p0x + 0.5f), (int)(zone->p0y + 0.5f),
+                      thickness, 76, 84, 255);
+}
+
+static void draw_overlay_zone_quad_black(FFmpegStreamer *s,
+                                         const DetectZoneRect *zone,
+                                         int thickness) {
+    if (s == NULL || zone == NULL || !zone->valid) {
+        return;
+    }
+
+    draw_nv12_line(s, (int)(zone->p0x + 0.5f), (int)(zone->p0y + 0.5f),
+                      (int)(zone->p1x + 0.5f), (int)(zone->p1y + 0.5f),
+                      thickness, 16, 128, 128);
+    draw_nv12_line(s, (int)(zone->p1x + 0.5f), (int)(zone->p1y + 0.5f),
+                      (int)(zone->p2x + 0.5f), (int)(zone->p2y + 0.5f),
+                      thickness, 16, 128, 128);
+    draw_nv12_line(s, (int)(zone->p2x + 0.5f), (int)(zone->p2y + 0.5f),
+                      (int)(zone->p3x + 0.5f), (int)(zone->p3y + 0.5f),
+                      thickness, 16, 128, 128);
+    draw_nv12_line(s, (int)(zone->p3x + 0.5f), (int)(zone->p3y + 0.5f),
+                      (int)(zone->p0x + 0.5f), (int)(zone->p0y + 0.5f),
+                      thickness, 16, 128, 128);
+}
+
+static void draw_detect_zones(FFmpegStreamer *s,
+                              rga_buffer_t dst,
+                              const ZoneOverlayState *zone_state) {
+    if (zone_state == NULL || !zone_state->zone_valid) {
+        return;
+    }
+
+    (void)dst;
+    draw_overlay_zone_quad_red(s, &zone_state->danger_zone, 4);
+    if (zone_state->work_zone.p0x != 0.0f ||
+        zone_state->work_zone.p1x != 0.0f ||
+        zone_state->work_zone.p2x != 0.0f ||
+        zone_state->work_zone.p3x != 0.0f) {
+        draw_overlay_zone_quad_black(s, &zone_state->work_zone, 3);
+    } else {
+        nv12_fill_rect(s,
+                       (int)(zone_state->work_zone.x1 + 0.5f),
+                       (int)(zone_state->work_zone.y1 + 0.5f),
+                       (int)(zone_state->work_zone.x2 - zone_state->work_zone.x1 + 0.5f),
+                       4,
+                       16,
+                       128);
+        nv12_fill_rect(s,
+                       (int)(zone_state->work_zone.x1 + 0.5f),
+                       (int)(zone_state->work_zone.y2 + 0.5f) - 4,
+                       (int)(zone_state->work_zone.x2 - zone_state->work_zone.x1 + 0.5f),
+                       4,
+                       16,
+                       128);
+        nv12_fill_rect(s,
+                       (int)(zone_state->work_zone.x1 + 0.5f),
+                       (int)(zone_state->work_zone.y1 + 0.5f),
+                       4,
+                       (int)(zone_state->work_zone.y2 - zone_state->work_zone.y1 + 0.5f),
+                       16,
+                       128);
+        nv12_fill_rect(s,
+                       (int)(zone_state->work_zone.x2 + 0.5f) - 4,
+                       (int)(zone_state->work_zone.y1 + 0.5f),
+                       4,
+                       (int)(zone_state->work_zone.y2 - zone_state->work_zone.y1 + 0.5f),
+                       16,
+                       128);
+    }
 }
 
 
 
-static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect_state) {
+static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect_state, const ZoneOverlayState *zone_state) {
 
     rga_buffer_t dst;
 
@@ -521,9 +707,33 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
 
     dst.hstride = 768;
 
-    draw_detect_zones(s, dst, detect_state);
+    draw_detect_zones(s, dst, zone_state);
 
     if (detect_state == NULL || !detect_state->valid || detect_state->box_count <= 0) return;
+
+    {
+        static int64_t last_box_log_ms = 0;
+        int64_t now_log_ms = get_mono_time_ms();
+        if (now_log_ms - last_box_log_ms >= 1000) {
+            int log_count = detect_state->box_count;
+            if (log_count > 3) log_count = 3;
+            printf("[Child][AIOverlay] boxes=%d frame=%lld ts=%lld\n",
+                   detect_state->box_count,
+                   (long long)detect_state->frame_seq,
+                   (long long)detect_state->timestamp_ms);
+            for (int bi = 0; bi < log_count; bi++) {
+                printf("[Child][AIOverlay] #%d cls=%d score=%.3f xy=(%.1f,%.1f)-(%.1f,%.1f)\n",
+                       bi,
+                       detect_state->boxes[bi].class_id,
+                       detect_state->boxes[bi].score,
+                       detect_state->boxes[bi].x1,
+                       detect_state->boxes[bi].y1,
+                       detect_state->boxes[bi].x2,
+                       detect_state->boxes[bi].y2);
+            }
+            last_box_log_ms = now_log_ms;
+        }
+    }
 
     count = detect_state->box_count;
 
@@ -547,8 +757,6 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
 
         int border = 4;
         int class_id = detect_state->boxes[i].class_id;
-        unsigned int box_color = osd_class_color_rgb(class_id);
-
         im_rect rects[4];
 
         IM_STATUS status;
@@ -591,13 +799,14 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
 
 
 
-        for (edge = 0; edge < 4; edge++) {
-
-            status = imfill_t(dst, rects[edge], box_color, IM_SYNC);
-
-            if (status != IM_STATUS_SUCCESS) return;
-
-        }
+        (void)rects;
+        (void)status;
+        (void)edge;
+        /* Draw AI boxes directly into NV12 so zone/RGA overlay cannot hide them. */
+        draw_nv12_line(s, x1, y1, x2, y1, border, 144, 54, 34);
+        draw_nv12_line(s, x2, y1, x2, y2, border, 144, 54, 34);
+        draw_nv12_line(s, x2, y2, x1, y2, border, 144, 54, 34);
+        draw_nv12_line(s, x1, y2, x1, y1, border, 144, 54, 34);
 
     }
 
@@ -609,7 +818,7 @@ static void draw_detect_boxes(FFmpegStreamer *s, const DetectSharedState *detect
 
 
 
-int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSharedState *detect_state) {
+int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSharedState *detect_state, const ZoneOverlayState *zone_state) {
 
     int ret;
 
@@ -664,7 +873,7 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
     
 
-    draw_detect_boxes(s, detect_state);
+    draw_detect_boxes(s, detect_state, zone_state);
 
 
 
@@ -823,7 +1032,7 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
 
 int streamer_push_zerocopy(FFmpegStreamer *s, int dma_fd) {
 
-    return streamer_push_zerocopy_overlay(s, dma_fd, NULL);
+    return streamer_push_zerocopy_overlay(s, dma_fd, NULL, NULL);
 
 }
 

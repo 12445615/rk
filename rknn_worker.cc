@@ -131,6 +131,22 @@ static void write_detect_results(const object_detect_result_list *od_results,
         g_shared_state->boxes[i].class_id = od_results->results[i].cls_id;
     }
     g_shared_state->valid = 1;
+    if (g_shared_state->box_count > 0) {
+        static int64_t last_write_log_ms = 0;
+        if (frame_wall_ms - last_write_log_ms >= 1000) {
+            printf("[AI][SharedWrite] boxes=%d frame=%lld ts=%lld #0 cls=%d score=%.3f xy=(%.1f,%.1f)-(%.1f,%.1f)\n",
+                   g_shared_state->box_count,
+                   (long long)frame_seq,
+                   (long long)frame_wall_ms,
+                   g_shared_state->boxes[0].class_id,
+                   g_shared_state->boxes[0].score,
+                   g_shared_state->boxes[0].x1,
+                   g_shared_state->boxes[0].y1,
+                   g_shared_state->boxes[0].x2,
+                   g_shared_state->boxes[0].y2);
+            last_write_log_ms = frame_wall_ms;
+        }
+    }
     __sync_fetch_and_add(&g_shared_state->version, 1);
 }
 
@@ -238,7 +254,7 @@ static void *infer_thread_main(void *arg) {
 extern "C" void rknn_worker_config_defaults(RknnWorkerConfig *config) {
     memset(config, 0, sizeof(*config));
     config->model_path = "/root/model/best_fp16.rknn";
-    config->conf_threshold = 0.5f;
+    config->conf_threshold = 0.65f;
     config->nms_threshold = 0.45f;
 }
 

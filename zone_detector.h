@@ -11,6 +11,14 @@ typedef struct {
     float y1;
     float x2;
     float y2;
+    float p0x;
+    float p0y;
+    float p1x;
+    float p1y;
+    float p2x;
+    float p2y;
+    float p3x;
+    float p3y;
 } ZoneRect;
 
 int zone_runtime_get_detected(ZoneRect *work_zone, ZoneRect *danger_zone);
@@ -18,6 +26,6 @@ void zone_runtime_reset(void);
 void zone_runtime_scan_frame(const CameraCtx *cam,
                              int buffer_index,
                              int64_t frame_mono_ms,
-                             DetectSharedState *shared);
+                             ZoneOverlayState *zone_state);
 
 #endif

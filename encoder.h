@@ -23,7 +23,7 @@ typedef struct {
 int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height, int fps);
 int streamer_push(FFmpegStreamer *s,uint8_t *nv12_data);
 int streamer_push_zerocopy(FFmpegStreamer *s, int dma_fd);
-int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSharedState *detect_state);
+int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSharedState *detect_state, const ZoneOverlayState *zone_state);
 int streamer_clean(FFmpegStreamer *s);
 
 

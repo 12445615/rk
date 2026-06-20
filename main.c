@@ -28,7 +28,7 @@
 #include <time.h>
 #include <RgaApi.h>
 #include <im2d.h>
-#include "osd_cache.h"//加入字
+#include "osd_cache.h"//加入�?
 #include "audio_alert.h"//加入语音
 
 #define VIDEO_DEV "/dev/video11"
@@ -65,7 +65,7 @@
 #define AI_NMS_ENV "CAMERA_FLOW_AI_NMS"
 #define AI_STATS_INTERVAL_MS 5000
 #define VIDEO_STATS_INTERVAL_MS 5000
-#define SAFETY_AI_STALE_MS 1500
+#define SAFETY_AI_STALE_MS 1000
 #define SAFETY_AI_SEND_INTERVAL_MS 500
 #define SAFETY_FUSION_SEND_INTERVAL_MS 500
 #define SAFETY_CONFIRM_DELAY_MS 5000
@@ -106,6 +106,7 @@ typedef struct {
     pid_t child_pid;
     int parent_sock;
     DetectSharedState *detect_state;
+    ZoneOverlayState *zone_state;
     int base_restart_ms;
     int max_restart_ms;
     int current_restart_ms;
@@ -150,9 +151,54 @@ typedef struct {
     int debug_rtmp_fail_triggered;
 
     DetectSharedState *detect_state;
+    ZoneOverlayState *zone_state;
     DetectSharedState detect_snapshot;
+    ZoneOverlayState zone_snapshot;
+    DetectSharedState locked_zone_snapshot;
+    DetectSharedState last_ai_snapshot;
 } ChildOutputCtx;
 
+static void overlay_prepare_static_zone_and_ai(ChildOutputCtx *ctx,
+                                               DetectSharedState *overlay,
+                                               int64_t frame_wall_ms) {
+    if (ctx == NULL || overlay == NULL) {
+        return;
+    }
+
+    if (overlay->zone_valid) {
+        ctx->locked_zone_snapshot.zone_valid = overlay->zone_valid;
+        ctx->locked_zone_snapshot.work_zone = overlay->work_zone;
+        ctx->locked_zone_snapshot.danger_zone = overlay->danger_zone;
+    } else if (ctx->locked_zone_snapshot.zone_valid) {
+        overlay->zone_valid = ctx->locked_zone_snapshot.zone_valid;
+        overlay->work_zone = ctx->locked_zone_snapshot.work_zone;
+        overlay->danger_zone = ctx->locked_zone_snapshot.danger_zone;
+    }
+
+    if (overlay->valid && overlay->box_count > 0) {
+        ctx->last_ai_snapshot.valid = overlay->valid;
+        ctx->last_ai_snapshot.box_count = overlay->box_count;
+        ctx->last_ai_snapshot.frame_seq = overlay->frame_seq;
+        ctx->last_ai_snapshot.timestamp_ms = overlay->timestamp_ms;
+        memcpy(ctx->last_ai_snapshot.boxes,
+               overlay->boxes,
+               sizeof(ctx->last_ai_snapshot.boxes));
+        return;
+    }
+
+    if (ctx->last_ai_snapshot.valid &&
+        ctx->last_ai_snapshot.box_count > 0 &&
+        ctx->last_ai_snapshot.timestamp_ms > 0 &&
+        frame_wall_ms - ctx->last_ai_snapshot.timestamp_ms <= SAFETY_AI_STALE_MS) {
+        overlay->valid = ctx->last_ai_snapshot.valid;
+        overlay->box_count = ctx->last_ai_snapshot.box_count;
+        overlay->frame_seq = ctx->last_ai_snapshot.frame_seq;
+        overlay->timestamp_ms = ctx->last_ai_snapshot.timestamp_ms;
+        memcpy(overlay->boxes,
+               ctx->last_ai_snapshot.boxes,
+               sizeof(ctx->last_ai_snapshot.boxes));
+    }
+}
 typedef struct {
     RknnWorker worker;
     int started;
@@ -167,7 +213,6 @@ typedef struct {
     uint64_t skipped_interval_count;
     DetectSharedState *detect_state;
 } AiPipeline;
-
 static void sig_handler(int sig) {
     (void)sig;
     is_running = 0;
@@ -593,7 +638,7 @@ static int detect_snapshot_read(DetectSharedState *shared, DetectSharedState *sn
         return 0;
     }
 
-    for (tries = 0; tries < 3; tries++) {
+    for (tries = 0; tries < 12; tries++) {
         before = shared->version;
         if ((before & 1U) != 0U) {
             continue;
@@ -619,7 +664,7 @@ static int detect_snapshot_read_overlay(DetectSharedState *shared, DetectSharedS
         return 0;
     }
 
-    for (tries = 0; tries < 3; tries++) {
+    for (tries = 0; tries < 12; tries++) {
         before = shared->version;
         if ((before & 1U) != 0U) {
             continue;
@@ -631,6 +676,32 @@ static int detect_snapshot_read_overlay(DetectSharedState *shared, DetectSharedS
         if (before == after && (after & 1U) == 0U &&
             (snapshot->valid || snapshot->zone_valid)) {
             return snapshot->box_count > 0 || snapshot->zone_valid;
+        }
+    }
+
+    return 0;
+}
+
+static int zone_snapshot_read(ZoneOverlayState *shared, ZoneOverlayState *snapshot) {
+    uint32_t before;
+    uint32_t after;
+    int tries;
+
+    if (shared == NULL || snapshot == NULL || !shared->zone_valid) {
+        return 0;
+    }
+
+    for (tries = 0; tries < 12; tries++) {
+        before = shared->version;
+        if ((before & 1U) != 0U) {
+            continue;
+        }
+        __sync_synchronize();
+        memcpy(snapshot, shared, sizeof(*snapshot));
+        __sync_synchronize();
+        after = shared->version;
+        if (before == after && (after & 1U) == 0U && snapshot->zone_valid) {
+            return 1;
         }
     }
 
@@ -680,17 +751,55 @@ static uint8_t safety_score_to_percent(float score) {
 }
 
 
-static int safety_box_center_in_zone(const DetectBox *box, const ZoneRect *rect) {
-    float cx;
-    float cy;
+static float safety_cross2(float ax, float ay, float bx, float by, float px, float py) {
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
 
-    if (box == NULL || rect == NULL || !rect->valid) {
+static int safety_point_in_zone(float x, float y, const ZoneRect *rect) {
+    float c0;
+    float c1;
+    float c2;
+    float c3;
+    const float eps = 1.0f;
+
+    if (rect == NULL || !rect->valid) {
         return 0;
     }
 
-    cx = (box->x1 + box->x2) * 0.5f;
-    cy = (box->y1 + box->y2) * 0.5f;
-    return cx >= rect->x1 && cx <= rect->x2 && cy >= rect->y1 && cy <= rect->y2;
+    if (x < rect->x1 - eps || x > rect->x2 + eps || y < rect->y1 - eps || y > rect->y2 + eps) {
+        return 0;
+    }
+
+    if (rect->p0x == 0.0f && rect->p0y == 0.0f &&
+        rect->p1x == 0.0f && rect->p1y == 0.0f &&
+        rect->p2x == 0.0f && rect->p2y == 0.0f &&
+        rect->p3x == 0.0f && rect->p3y == 0.0f) {
+        return 1;
+    }
+
+    c0 = safety_cross2(rect->p0x, rect->p0y, rect->p1x, rect->p1y, x, y);
+    c1 = safety_cross2(rect->p1x, rect->p1y, rect->p2x, rect->p2y, x, y);
+    c2 = safety_cross2(rect->p2x, rect->p2y, rect->p3x, rect->p3y, x, y);
+    c3 = safety_cross2(rect->p3x, rect->p3y, rect->p0x, rect->p0y, x, y);
+
+    return (c0 >= -eps && c1 >= -eps && c2 >= -eps && c3 >= -eps) ||
+           (c0 <= eps && c1 <= eps && c2 <= eps && c3 <= eps);
+}
+
+static int safety_box_center_in_zone(const DetectBox *box, const ZoneRect *rect) {
+    if (box == NULL) {
+        return 0;
+    }
+    return safety_point_in_zone((box->x1 + box->x2) * 0.5f,
+                                (box->y1 + box->y2) * 0.5f,
+                                rect);
+}
+
+static int safety_box_bottom_in_zone(const DetectBox *box, const ZoneRect *rect) {
+    if (box == NULL) {
+        return 0;
+    }
+    return safety_point_in_zone((box->x1 + box->x2) * 0.5f, box->y2, rect);
 }
 
 static void safety_build_ai_status(DetectSharedState *shared,
@@ -732,6 +841,9 @@ static void safety_build_ai_status(DetectSharedState *shared,
     for (int i = 0; i < snapshot.box_count; i++) {
         char *name = coco_cls_to_name(snapshot.boxes[i].class_id);
         uint8_t score_percent = safety_score_to_percent(snapshot.boxes[i].score);
+        if (score_percent < 65) {
+            continue;
+        }
         if (score_percent > confidence) {
             confidence = score_percent;
         }
@@ -747,9 +859,9 @@ static void safety_build_ai_status(DetectSharedState *shared,
         } else if (strcmp(name, "person") == 0) {
             has_person = 1;
             if (danger_zone.valid &&
-                safety_box_center_in_zone(&snapshot.boxes[i], &danger_zone) &&
+                safety_box_bottom_in_zone(&snapshot.boxes[i], &danger_zone) &&
                 (dynamic_zone_detected ||
-                 !safety_box_center_in_zone(&snapshot.boxes[i], &work_zone))) {
+                 !safety_box_bottom_in_zone(&snapshot.boxes[i], &work_zone))) {
                 has_intrusion = 1;
             }
         } else if (strcmp(name, "fire") == 0) {
@@ -774,7 +886,7 @@ static void safety_build_ai_status(DetectSharedState *shared,
         flags |= SAFETY_AI_FLAG_NO_VEST;
     }
     if (has_fire && !work_zone.valid) {
-        /* 未配置工作区时保持旧逻辑：bit4 作为通用 fire_detected。 */
+        /* 未配置工作区时保持旧逻辑：bit4 作为通用 fire_detected�?*/
         flags |= SAFETY_AI_FLAG_FIRE;
     } else {
         if (has_fire_in_work_zone) {
@@ -1599,7 +1711,7 @@ static int child_update_target_recording(ChildOutputCtx *ctx,
             return 0;
         }
 
-        ret = streamer_push_zerocopy_overlay(&ctx->record_streamer, dma_fd, overlay);
+        ret = streamer_push_zerocopy_overlay(&ctx->record_streamer, dma_fd, overlay, NULL);
         if (ret < 0) {
             fprintf(stderr, "[Child] Target local segment push failed, close broken segment.\n");
             child_close_record_segment(ctx, 1);
@@ -1664,6 +1776,7 @@ static int child_rotate_or_restore_output(ChildOutputCtx *ctx,
 static int child_push_frame_repeated(ChildOutputCtx *ctx,
                                      int dma_fd,
                                      const DetectSharedState *overlay,
+                                     const ZoneOverlayState *zone_overlay,
                                      int repeat_count) {
     int ret = 0;
     int i;
@@ -1673,7 +1786,7 @@ static int child_push_frame_repeated(ChildOutputCtx *ctx,
     }
 
     for (i = 0; i < repeat_count; i++) {
-        ret = streamer_push_zerocopy_overlay(&ctx->streamer, dma_fd, overlay);
+        ret = streamer_push_zerocopy_overlay(&ctx->streamer, dma_fd, overlay, zone_overlay);
         if (ret < 0) {
             return ret;
         }
@@ -1682,7 +1795,7 @@ static int child_push_frame_repeated(ChildOutputCtx *ctx,
     return ret;
 }
 
-static int child_stream_loop(int sock, DetectSharedState *detect_state) {
+static int child_stream_loop(int sock, DetectSharedState *detect_state, ZoneOverlayState *zone_state) {
     ChildOutputCtx ctx;
     int64_t frame_mono_ms;
     int64_t frame_wall_ms;
@@ -1694,6 +1807,7 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.detect_state = detect_state;
+    ctx.zone_state = zone_state;
     ctx.rtmp_retry_backoff_ms = CHILD_RTMP_RETRY_BASE_MS;
     ctx.rtmp_retry_max_ms = CHILD_RTMP_RETRY_MAX_MS;
     duplicate_frames = env_to_positive_int(STREAM_DUP_FRAMES_ENV, STREAM_DUP_FRAMES_DEFAULT);
@@ -1732,11 +1846,21 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
 
     while (is_running && (child_fd = recv_fd(sock)) >= 0) {
         const DetectSharedState *overlay = NULL;
+        const ZoneOverlayState *zone_overlay = NULL;
 
         frame_mono_ms = mono_now_ms();
         frame_wall_ms = wall_now_ms();
-        if (detect_snapshot_read_overlay(ctx.detect_state, &ctx.detect_snapshot)) {
+        if (detect_snapshot_read(ctx.detect_state, &ctx.detect_snapshot)) {
+            ctx.last_ai_snapshot = ctx.detect_snapshot;
             overlay = &ctx.detect_snapshot;
+        } else if (ctx.last_ai_snapshot.valid &&
+                   ctx.last_ai_snapshot.box_count > 0 &&
+                   ctx.last_ai_snapshot.timestamp_ms > 0 &&
+                   frame_wall_ms - ctx.last_ai_snapshot.timestamp_ms <= SAFETY_AI_STALE_MS) {
+            overlay = &ctx.last_ai_snapshot;
+        }
+        if (zone_snapshot_read(ctx.zone_state, &ctx.zone_snapshot)) {
+            zone_overlay = &ctx.zone_snapshot;
         }
 
         if (ctx.mode == CHILD_OUTPUT_FILE) {
@@ -1757,17 +1881,17 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
                 fprintf(stderr, "[Child] Debug: simulate RTMP disconnect at frame %d.\n",
                         ctx.debug_rtmp_frame_count);
             } else {
-                ret = child_push_frame_repeated(&ctx, child_fd, overlay, duplicate_frames);
+                ret = child_push_frame_repeated(&ctx, child_fd, overlay, zone_overlay, duplicate_frames);
             }
         } else {
-            ret = child_push_frame_repeated(&ctx, child_fd, overlay, duplicate_frames);
+            ret = child_push_frame_repeated(&ctx, child_fd, overlay, zone_overlay, duplicate_frames);
         }
 
         if (ret < 0) {
             if (ctx.mode == CHILD_OUTPUT_RTMP && ctx.video_store_ready) {
                 fprintf(stderr, "[Child] RTMP push failed, switch to local file mode.\n");
                 if (child_switch_to_file_mode(&ctx, frame_mono_ms, frame_wall_ms) == 0) {
-                    ret = child_push_frame_repeated(&ctx, child_fd, overlay, duplicate_frames);
+                    ret = child_push_frame_repeated(&ctx, child_fd, overlay, zone_overlay, duplicate_frames);
                     if (ret == 0) {
                         char ack = 'k';
                         if (write(sock, &ack, 1) <= 0) {
@@ -1785,11 +1909,13 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state) {
             break;
         }
 
-        child_update_target_recording(&ctx,
-                                      child_fd,
-                                      overlay,
-                                      frame_mono_ms,
-                                      frame_wall_ms);
+        /*
+         * Keep only the primary encoder active. Opening a second h264_rkmpp
+         * encoder for target clips can corrupt MPP buffer refs during shutdown
+         * on this board/kernel, leading to kernel Oops after Ctrl-C.
+         */
+        (void)overlay;
+        (void)frame_wall_ms;
 
         char ack = 'k';
         if (write(sock, &ack, 1) <= 0) {
@@ -1838,7 +1964,7 @@ static int spawn_stream_child(StreamState *stream) {
         close(sv[0]);
         g_video_uploader_for_signal = NULL;
         g_video_uploader_signal_ready = 0;
-        int ret = child_stream_loop(sv[1], stream->detect_state);
+        int ret = child_stream_loop(sv[1], stream->detect_state, stream->zone_state);
         close(sv[1]);
         exit(ret == 0 ? 0 : 1);
     }
@@ -1897,6 +2023,7 @@ int main(void) {
         .child_pid = -1,
         .parent_sock = -1,
         .detect_state = NULL,
+        .zone_state = NULL,
         .base_restart_ms = STREAM_RESTART_BASE_MS,
         .max_restart_ms = STREAM_RESTART_MAX_MS,
         .current_restart_ms = STREAM_RESTART_BASE_MS,
@@ -1906,6 +2033,7 @@ int main(void) {
     int shmid = -1;
     void *shmaddr = (void *)-1;
     DetectSharedState *detect_state = NULL;
+    ZoneOverlayState *zone_state = NULL;
     int dma_fds[BUF_COUNT] = { -1, -1, -1, -1 };
     VideoUploader video_uploader;
     AiPipeline ai_pipeline;
@@ -1954,6 +2082,15 @@ int main(void) {
         stream.detect_state = detect_state;
     }
 
+    zone_state = mmap(NULL, sizeof(*zone_state), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (zone_state == MAP_FAILED) {
+        perror("zone mmap");
+        zone_state = NULL;
+    } else {
+        memset(zone_state, 0, sizeof(*zone_state));
+        stream.zone_state = zone_state;
+    }
+
     camera_sensor_lock_fps_controls();
 
     if (camera_init(&cam, VIDEO_DEV, WIDTH, HEIGHT) < 0) {
@@ -1961,7 +2098,7 @@ int main(void) {
         exit(1);
     }
 
-    /* 保留这段共享内存初始化，后面如果有别的进程要复用帧数据还能继续接。 */
+    /* 保留这段共享内存初始化，后面如果有别的进程要复用帧数据还能继续接�?*/
     shmid = shmget(IPC_PRIVATE, FRAME_SIZE, IPC_CREAT | 0666);
     if (shmid < 0) {
         perror("shmget");
@@ -2081,7 +2218,7 @@ int main(void) {
         frame_wall_ms = wall_now_ms();
         frame_mono_ms = mono_now_ms();
         capture_frames++;
-        zone_runtime_scan_frame(&cam, qbuf.index, frame_mono_ms, detect_state);
+        zone_runtime_scan_frame(&cam, qbuf.index, frame_mono_ms, zone_state);
 
         if (stream.stream_online) {
             if (send_fd(stream.parent_sock, current_dma_fd) < 0) {
@@ -2144,7 +2281,7 @@ int main(void) {
             last_video_stats_ms = frame_mono_ms;
         }
 
-        /* 推流失败不应该拖死采集主循环，这一帧必须回给驱动。 */
+        /* 推流失败不应该拖死采集主循环，这一帧必须回给驱动�?*/
         if (ioctl(cam.fd, VIDIOC_QBUF, &qbuf) < 0) {
             perror("[Parent] camera queue buf");
             break;
@@ -2170,7 +2307,7 @@ cleanup:
     stop_mqtt_reporter();
     stop_stream_child(&stream);
     
-    //字清理
+    //字清�?
     osd_cache_deinit();
     
     
@@ -2198,6 +2335,9 @@ cleanup:
     }
     if (detect_state != NULL) {
         munmap(detect_state, sizeof(*detect_state));
+    }
+    if (zone_state != NULL) {
+        munmap(zone_state, sizeof(*zone_state));
     }
 
     return 0;

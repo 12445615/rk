@@ -20,7 +20,22 @@ typedef struct {
     float y1;
     float x2;
     float y2;
+    float p0x;
+    float p0y;
+    float p1x;
+    float p1y;
+    float p2x;
+    float p2y;
+    float p3x;
+    float p3y;
 } DetectZoneRect;
+
+typedef struct {
+    uint32_t version;
+    int zone_valid;
+    DetectZoneRect work_zone;
+    DetectZoneRect danger_zone;
+} ZoneOverlayState;
 
 typedef struct {
     uint32_t version;

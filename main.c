@@ -140,6 +140,7 @@ typedef struct {
     int64_t record_segment_start_wall_ms;
     int64_t record_segment_start_mono_ms;
     int64_t record_target_last_seen_mono_ms;
+    int record_segment_has_target;
     char record_segment_path[PATH_MAX];
 
     int rtmp_retry_backoff_ms;
@@ -737,6 +738,8 @@ typedef struct {
     int emergency_locked;
     int fault_locked;
     int suppress_fusion_send;
+    int manual_reset_override;
+    uint16_t last_reset_ok_event_id;
     int initialized;
 } SafetyRuntimeState;
 
@@ -809,6 +812,7 @@ static void safety_build_ai_status(DetectSharedState *shared,
     DetectSharedState snapshot;
     uint16_t flags = 0;
     uint8_t confidence = 0;
+    uint8_t fire_confidence = 0;
     int has_helmet = 0;
     int has_vest = 0;
     int has_no_helmet = 0;
@@ -866,6 +870,9 @@ static void safety_build_ai_status(DetectSharedState *shared,
             }
         } else if (strcmp(name, "fire") == 0) {
             has_fire = 1;
+            if (score_percent > fire_confidence) {
+                fire_confidence = score_percent;
+            }
             if (work_zone.valid) {
                 if (safety_box_center_in_zone(&snapshot.boxes[i], &work_zone)) {
                     has_fire_in_work_zone = 1;
@@ -904,7 +911,7 @@ static void safety_build_ai_status(DetectSharedState *shared,
     }
 
     *ai_flags_out = flags;
-    *ai_confidence_out = confidence;
+    *ai_confidence_out = has_fire ? fire_confidence : confidence;
 }
 
 static int safety_sensor_rise_high(SafetyRuntimeState *state,
@@ -952,7 +959,10 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
     int ppe_bad = (ai_flags & (SAFETY_AI_FLAG_NO_HELMET | SAFETY_AI_FLAG_NO_VEST)) != 0;
     int intrusion = (ai_flags & SAFETY_AI_FLAG_INTRUSION) != 0;
     int stm32_online = stm32 != NULL && stm32->online;
-    int reset_ok = stm32 != NULL && stm32->last_event_type == SAFETY_STM32_CODE_RESET_OK;
+    int reset_ok = stm32 != NULL &&
+                   stm32->last_event_type == SAFETY_STM32_CODE_RESET_OK &&
+                   stm32->last_event_id != 0 &&
+                   (state == NULL || stm32->last_event_id != state->last_reset_ok_event_id);
     int zone_detected = zone_runtime_get_detected(NULL, NULL);
     int zone_blocked = mqtt_get_zone_blocked();
     int zone_confirm_enabled = mqtt_get_zone_confirm_enabled();
@@ -974,6 +984,40 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         state->fault_locked = 0;
         state->ppe_first_seen_ms = 0;
         state->intrusion_first_seen_ms = 0;
+        state->last_fusion_send_ms = 0;
+        state->last_permit_decision = 0xFF;
+        state->last_risk_level = 0xFF;
+        state->last_risk_type = 0xFF;
+        state->last_voice_action = 0xFF;
+        state->last_stm32_action = 0xFF;
+        state->last_explain_code = 0xFF;
+        state->manual_reset_override = 1;
+        state->last_reset_ok_event_id = stm32->last_event_id;
+        printf("[Safety] STM32 reset OK event=%u: enter manual reset override\n", stm32->last_event_id);
+        *permit_decision = SAFETY_PERMIT_ALLOW;
+        *risk_level = SAFETY_RISK_SAFE;
+        *risk_type = SAFETY_RISK_TYPE_NONE;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *explain_code = 88;
+        return;
+    }
+
+    if (state != NULL && state->manual_reset_override) {
+        if ((ai_flags & (SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT | SAFETY_AI_FLAG_INTRUSION)) == 0 &&
+            !(stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_EMERGENCY_STOP) &&
+            !(stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_FAULT) &&
+            !(stm32_online && stm32->fault_code != 0)) {
+            *permit_decision = SAFETY_PERMIT_ALLOW;
+            *risk_level = SAFETY_RISK_SAFE;
+            *risk_type = SAFETY_RISK_TYPE_NONE;
+            *voice_action = SAFETY_VOICE_NONE;
+            *stm32_action = SAFETY_STM32_ACTION_KEEP;
+            *explain_code = 88;
+            return;
+        }
+        printf("[Safety] manual reset override exit: new high-risk event detected\n");
+        state->manual_reset_override = 0;
     }
 
     if ((stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_EMERGENCY_STOP) ||
@@ -1016,11 +1060,8 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         *risk_level = SAFETY_RISK_CRITICAL;
         *risk_type = SAFETY_RISK_TYPE_FIRE;
         *voice_action = SAFETY_VOICE_FIRE_WARNING;
-        *stm32_action = SAFETY_STM32_ACTION_LOCKOUT_WAIT_RESET;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
         *explain_code = 42;
-        if (state->fire_lock_sent) {
-            state->suppress_fusion_send = 1;
-        }
         return;
     }
 
@@ -1116,23 +1157,14 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
     }
 
     if (ai_flags & SAFETY_AI_FLAG_FIRE) {
-        if (safety_sensor_rise_high(state, stm32, frame_mono_ms)) {
-            if (state != NULL) {
-                state->fire_locked = 1;
-            }
-            *risk_level = SAFETY_RISK_CRITICAL;
-            *risk_type = SAFETY_RISK_TYPE_FIRE;
-            *voice_action = SAFETY_VOICE_FIRE_WARNING;
-            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
-            *explain_code = 42;
-            return;
+        if (state != NULL) {
+            state->fire_locked = 1;
         }
-
-        *risk_level = SAFETY_RISK_WARNING;
+        *risk_level = SAFETY_RISK_CRITICAL;
         *risk_type = SAFETY_RISK_TYPE_FIRE;
-        *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP;
-        *explain_code = 41;
+        *voice_action = SAFETY_VOICE_FIRE_WARNING;
+        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+        *explain_code = 42;
         return;
     }
 
@@ -1290,6 +1322,9 @@ static void safety_runtime_update(SafetyInterlockClient *client,
                            &state->stm32_action,
                            &state->explain_code);
     ai_detect_state = safety_ai_flags_to_detect_state(state->ai_flags);
+    if (state->fire_locked && ai_detect_state == AI_DETECT_STATE_NONE) {
+        ai_detect_state = AI_DETECT_STATE_FIRE_OUT_ZONE;
+    }
     last_ai_detect_state = safety_ai_flags_to_detect_state(state->last_ai_flags);
     safety_client_update_ai_detect_state(client,
                                          ai_detect_state,
@@ -1435,9 +1470,28 @@ static void stop_stream_child(StreamState *stream) {
     }
 
     if (stream->child_pid > 0) {
+        int status;
+        int waited_ms = 0;
+
+        /*
+         * Let the child close an active target-recording segment first. If it
+         * does not exit quickly, fall back to SIGKILL to avoid hanging on MPP.
+         */
         kill(stream->child_pid, SIGTERM);
-        waitpid(stream->child_pid, NULL, 0);
-        stream->child_pid = -1;
+        while (waited_ms < 1500) {
+            pid_t ret = waitpid(stream->child_pid, &status, WNOHANG);
+            if (ret == stream->child_pid) {
+                stream->child_pid = -1;
+                break;
+            }
+            usleep(100000);
+            waited_ms += 100;
+        }
+        if (stream->child_pid > 0) {
+            kill(stream->child_pid, SIGKILL);
+            waitpid(stream->child_pid, NULL, 0);
+            stream->child_pid = -1;
+        }
     }
 
     stream->stream_online = 0;
@@ -1564,7 +1618,6 @@ static int child_open_file_segment(ChildOutputCtx *ctx,
 }
 
 static void child_reset_record_streamer(ChildOutputCtx *ctx) {
-    memset(&ctx->record_streamer, 0, sizeof(ctx->record_streamer));
     ctx->record_streamer_ready = 0;
 }
 
@@ -1578,7 +1631,7 @@ static int child_close_record_segment(ChildOutputCtx *ctx, int broken) {
     }
 
     end_ms = wall_now_ms();
-    streamer_clean(&ctx->record_streamer);
+    streamer_stop_side_record(&ctx->streamer);
     child_reset_record_streamer(ctx);
 
     rc = video_store_get_file_size(ctx->record_segment_path, &size_bytes);
@@ -1589,28 +1642,41 @@ static int child_close_record_segment(ChildOutputCtx *ctx, int broken) {
     }
 
     if (ctx->record_segment_id > 0) {
-        if (broken) {
+        if (!ctx->record_segment_has_target && !broken) {
+            if (ctx->record_segment_path[0] != '\0' && unlink(ctx->record_segment_path) != 0 && errno != ENOENT) {
+                fprintf(stderr, "[Child] Failed to delete non-event segment %s: %s\n",
+                        ctx->record_segment_path, strerror(errno));
+            }
+            rc = local_store_delete_video_segment(&ctx->store, ctx->record_segment_id);
+            if (rc != 0) {
+                fprintf(stderr, "[Child] Failed to delete non-event segment metadata: %d\n", rc);
+            }
+            printf("[Child] Non-event segment deleted: %s size=%lld\n",
+                   ctx->record_segment_path, (long long)size_bytes);
+        } else if (broken) {
             rc = video_store_mark_segment_broken(&ctx->video_store,
                                                  ctx->record_segment_id,
                                                  end_ms,
                                                  size_bytes);
+            if (rc != 0) {
+                fprintf(stderr, "[Child] Failed to mark target segment broken: %d\n", rc);
+            }
         } else {
             rc = video_store_finish_segment(&ctx->video_store,
                                             ctx->record_segment_id,
                                             end_ms,
                                             size_bytes);
-        }
-        if (rc != 0) {
-            fprintf(stderr, "[Child] Failed to update target segment metadata: %d\n", rc);
+            if (rc != 0) {
+                fprintf(stderr, "[Child] Failed to finish target segment metadata: %d\n", rc);
+            }
+            printf("[Child] Event segment kept: %s size=%lld\n",
+                   ctx->record_segment_path, (long long)size_bytes);
         }
     }
-
-    printf("[Child] Target local segment closed: %s size=%lld\n",
-           ctx->record_segment_path, (long long)size_bytes);
     ctx->record_segment_id = 0;
     ctx->record_segment_start_wall_ms = 0;
     ctx->record_segment_start_mono_ms = 0;
-    ctx->record_target_last_seen_mono_ms = 0;
+    ctx->record_segment_has_target = 0;
     ctx->record_segment_path[0] = '\0';
     return 0;
 }
@@ -1645,12 +1711,8 @@ static int child_open_record_segment(ChildOutputCtx *ctx,
     }
 
     child_reset_record_streamer(ctx);
-    if (streamer_init(&ctx->record_streamer,
-                      segment_path,
-                      WIDTH,
-                      HEIGHT,
-                      env_to_positive_int(STREAM_FPS_ENV, STREAM_FPS_DEFAULT)) < 0) {
-        fprintf(stderr, "[Child] Streamer init failed for target segment\n");
+    if (!ctx->streamer_ready || streamer_start_side_record(&ctx->streamer, segment_path) < 0) {
+        fprintf(stderr, "[Child] Side record muxer init failed for target segment\n");
         local_store_delete_video_segment(&ctx->store, segment_id);
         child_reset_record_streamer(ctx);
         return -1;
@@ -1660,9 +1722,8 @@ static int child_open_record_segment(ChildOutputCtx *ctx,
     ctx->record_segment_id = segment_id;
     ctx->record_segment_start_wall_ms = start_wall_ms;
     ctx->record_segment_start_mono_ms = start_mono_ms;
-    ctx->record_target_last_seen_mono_ms = start_mono_ms;
     snprintf(ctx->record_segment_path, sizeof(ctx->record_segment_path), "%s", segment_path);
-    printf("[Child] Target local segment started: %s\n", ctx->record_segment_path);
+    printf("[Child] Continuous local segment started: %s\n", ctx->record_segment_path);
     return 0;
 }
 
@@ -1681,40 +1742,43 @@ static int child_update_target_recording(ChildOutputCtx *ctx,
                                          int64_t frame_mono_ms,
                                          int64_t frame_wall_ms) {
     int has_target = child_overlay_has_target(overlay, frame_wall_ms);
-    int ret;
+    int in_event_keep_window;
+    int64_t segment_ms;
 
-    if (!ctx->video_store_ready) {
+    (void)dma_fd;
+
+    if (!ctx->video_store_ready || !ctx->streamer_ready) {
         return 0;
     }
 
     if (has_target) {
         ctx->record_target_last_seen_mono_ms = frame_mono_ms;
-        if (!ctx->record_streamer_ready &&
-            child_open_record_segment(ctx, frame_wall_ms, frame_mono_ms) != 0) {
+    }
+
+    in_event_keep_window =
+        ctx->record_target_last_seen_mono_ms > 0 &&
+        frame_mono_ms - ctx->record_target_last_seen_mono_ms <= CHILD_TARGET_RECORD_SEGMENT_MIN_MS;
+
+    if (!ctx->record_streamer_ready) {
+        if (child_open_record_segment(ctx, frame_wall_ms, frame_mono_ms) != 0) {
             return 0;
         }
     }
+
+    if (has_target || in_event_keep_window) {
+        ctx->record_segment_has_target = 1;
+    }
+
+    segment_ms = ctx->video_store.segment_duration_ms > 0 ?
+                 ctx->video_store.segment_duration_ms :
+                 CHILD_TARGET_RECORD_SEGMENT_MIN_MS;
 
     if (ctx->record_streamer_ready &&
-        frame_mono_ms - ctx->record_segment_start_mono_ms >= CHILD_TARGET_RECORD_SEGMENT_MAX_MS) {
+        frame_mono_ms - ctx->record_segment_start_mono_ms >= segment_ms) {
         child_close_record_segment(ctx, 0);
-        if (has_target) {
-            child_open_record_segment(ctx, frame_wall_ms, frame_mono_ms);
-        }
-    }
-
-    if (ctx->record_streamer_ready) {
-        if (!has_target &&
-            frame_mono_ms - ctx->record_segment_start_mono_ms >= CHILD_TARGET_RECORD_SEGMENT_MIN_MS &&
-            frame_mono_ms - ctx->record_target_last_seen_mono_ms >= CHILD_TARGET_RECORD_GRACE_MS) {
-            child_close_record_segment(ctx, 0);
-            return 0;
-        }
-
-        ret = streamer_push_zerocopy_overlay(&ctx->record_streamer, dma_fd, overlay, NULL);
-        if (ret < 0) {
-            fprintf(stderr, "[Child] Target local segment push failed, close broken segment.\n");
-            child_close_record_segment(ctx, 1);
+        child_open_record_segment(ctx, frame_wall_ms, frame_mono_ms);
+        if (has_target || in_event_keep_window) {
+            ctx->record_segment_has_target = 1;
         }
     }
 
@@ -1826,6 +1890,7 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state, ZoneOver
         ctx.store_ready = 1;
         if (video_store_init(&ctx.video_store, &ctx.store, NULL) == 0) {
             ctx.video_store_ready = 1;
+            local_store_recover_recording_video_segments(&ctx.store);
             printf("[Child] Video store ready, segment_ms=%lld, high_water=%lld, low_water=%lld\n",
                    (long long)ctx.video_store.segment_duration_ms,
                    (long long)ctx.video_store.high_water_bytes,
@@ -1871,6 +1936,12 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state, ZoneOver
             }
         }
 
+        child_update_target_recording(&ctx,
+                                      child_fd,
+                                      overlay,
+                                      frame_mono_ms,
+                                      frame_wall_ms);
+
         if (ctx.mode == CHILD_OUTPUT_RTMP &&
             ctx.debug_rtmp_fail_after_frames > 0 &&
             !ctx.debug_rtmp_fail_triggered) {
@@ -1909,14 +1980,6 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state, ZoneOver
             break;
         }
 
-        /*
-         * Keep only the primary encoder active. Opening a second h264_rkmpp
-         * encoder for target clips can corrupt MPP buffer refs during shutdown
-         * on this board/kernel, leading to kernel Oops after Ctrl-C.
-         */
-        (void)overlay;
-        (void)frame_wall_ms;
-
         char ack = 'k';
         if (write(sock, &ack, 1) <= 0) {
             close(child_fd);
@@ -1926,12 +1989,6 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state, ZoneOver
         close(child_fd);
     }
 
-    if (ctx.mode == CHILD_OUTPUT_FILE && ctx.streamer_ready) {
-        child_close_file_segment(&ctx, 0);
-    } else if (ctx.streamer_ready) {
-        streamer_clean(&ctx.streamer);
-        child_reset_streamer(&ctx);
-    }
     if (ctx.record_streamer_ready) {
         child_close_record_segment(&ctx, 0);
     }
@@ -1940,6 +1997,12 @@ static int child_stream_loop(int sock, DetectSharedState *detect_state, ZoneOver
         local_store_close(&ctx.store);
     }
 
+    /*
+     * Do not call streamer_clean() here. avcodec_free_context(h264_rkmpp)
+     * has repeatedly triggered MPP ref-count errors followed by kernel Oops
+     * on this board. The child process is short-lived, so let process exit
+     * reclaim userspace resources and avoid the buggy MPP teardown path.
+     */
     return 0;
 }
 
@@ -1966,7 +2029,7 @@ static int spawn_stream_child(StreamState *stream) {
         g_video_uploader_signal_ready = 0;
         int ret = child_stream_loop(sv[1], stream->detect_state, stream->zone_state);
         close(sv[1]);
-        exit(ret == 0 ? 0 : 1);
+        _exit(ret == 0 ? 0 : 1);
     }
 
     close(sv[1]);

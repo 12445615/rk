@@ -948,6 +948,82 @@ int local_store_reset_uploading_video_segments(LocalStore *store) {
     return 0;
 }
 
+
+int local_store_recover_recording_video_segments(LocalStore *store) {
+    sqlite3_stmt *select_stmt = NULL;
+    sqlite3_stmt *update_stmt = NULL;
+    int rc;
+    int recovered = 0;
+    int broken = 0;
+
+    if (store == NULL || store->db == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "SELECT id, file_path FROM video_segments WHERE state = 'recording';",
+        -1,
+        &select_stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "UPDATE video_segments SET state = ?, end_ms = CASE WHEN end_ms = 0 THEN created_at_ms ELSE end_ms END, size_bytes = ?, last_error = ? WHERE id = ?;",
+        -1,
+        &update_stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(select_stmt);
+        return EIO;
+    }
+
+    while ((rc = sqlite3_step(select_stmt)) == SQLITE_ROW) {
+        int64_t id = sqlite3_column_int64(select_stmt, 0);
+        const unsigned char *path_text = sqlite3_column_text(select_stmt, 1);
+        const char *path = path_text != NULL ? (const char *)path_text : "";
+        struct stat st;
+        const char *state = "broken";
+        const char *error = "recording segment recovered without data";
+        int64_t size = 0;
+
+        if (path[0] != '\0' && stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+            state = "pending";
+            error = "";
+            size = (int64_t)st.st_size;
+            recovered++;
+        } else {
+            broken++;
+        }
+
+        sqlite3_reset(update_stmt);
+        sqlite3_clear_bindings(update_stmt);
+        sqlite3_bind_text(update_stmt, 1, state, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(update_stmt, 2, size);
+        sqlite3_bind_text(update_stmt, 3, error, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(update_stmt, 4, id);
+        if (sqlite3_step(update_stmt) != SQLITE_DONE) {
+            sqlite3_finalize(update_stmt);
+            sqlite3_finalize(select_stmt);
+            return EIO;
+        }
+    }
+
+    sqlite3_finalize(update_stmt);
+    sqlite3_finalize(select_stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    if (recovered > 0 || broken > 0) {
+        printf("[VideoStore] recovered recording segments: pending=%d broken=%d\n", recovered, broken);
+    }
+    return 0;
+}
+
 int local_store_debug_fetch_video_segment_by_id(LocalStore *store,
                                                 int64_t id,
                                                 LocalVideoSegmentRecord *record,

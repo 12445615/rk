@@ -7,7 +7,7 @@
 
 #include "local_store.h"
 
-#define VIDEO_UPLOADER_HTTP_UPLOAD_URL "http://10.36.113.231:8080/api/video/upload"
+#define VIDEO_UPLOADER_HTTP_UPLOAD_URL "http://10.139.8.231:8080/api/video/upload"
 #define VIDEO_UPLOADER_HTTP_AUTH_TOKEN "CHANGE_ME_TOKEN"
 #define VIDEO_UPLOADER_HTTP_DEVICE_ID "0122-qt"
 #define VIDEO_UPLOADER_HTTP_CONNECT_TIMEOUT_SEC 5L

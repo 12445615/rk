@@ -10,9 +10,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SAFETY_HEARTBEAT_INTERVAL_MS 500
+#define SAFETY_HEARTBEAT_INTERVAL_MS 2000
 #define SAFETY_RECONNECT_INTERVAL_MS 1000
-#define SAFETY_STM32_OFFLINE_MS 2000
+#define SAFETY_STM32_OFFLINE_MS 6000
 #define SAFETY_SIMPLE_FRAME_SIZE 3
 #define SAFETY_SENSOR_FRAME_SIZE 9
 #define SAFETY_ACTUATOR_FRAME_SIZE 6
@@ -126,11 +126,11 @@ static uint16_t safety_expected_flags_from_code(uint8_t code) {
     switch (code) {
     case SAFETY_CODE_SAFE:
     case SAFETY_CODE_FIRE_WORK_ZONE:
-        return SAFETY_ACT_DEVICE_POWER_ON;
+        return (uint16_t)(SAFETY_ACT_DEVICE_POWER_ON | SAFETY_ACT_FAN_ON);
+    case SAFETY_CODE_PPE_DENY:
+        return SAFETY_ACT_FAN_ON;
     case SAFETY_CODE_FIRE_OUT_ZONE:
     case SAFETY_CODE_ENV_DANGER:
-        return (uint16_t)(SAFETY_ACT_FAN_ON | SAFETY_ACT_ALARM_ON);
-    case SAFETY_CODE_PPE_DENY:
     case SAFETY_CODE_INTRUSION:
     case SAFETY_CODE_FAULT:
     case SAFETY_CODE_EMERGENCY_ACK:
@@ -180,10 +180,12 @@ static void safety_handle_stm32_code(SafetyInterlockClient *client,
         flags |= SAFETY_ACT_INTERLOCK;
         flags |= SAFETY_ACT_ALARM_ON;
         client->snapshot.last_event_type = code;
+        client->snapshot.last_event_id++;
         break;
     case SAFETY_STM32_CODE_EMERGENCY_STOP:
         flags |= SAFETY_ACT_ALARM_ON;
         client->snapshot.last_event_type = code;
+        client->snapshot.last_event_id++;
         break;
     case SAFETY_STM32_CODE_FAULT:
         flags |= SAFETY_ACT_ALARM_ON;
@@ -195,13 +197,18 @@ static void safety_handle_stm32_code(SafetyInterlockClient *client,
         flags |= SAFETY_ACT_RESET_WAIT;
         flags |= SAFETY_ACT_ALARM_ON;
         client->snapshot.last_event_type = code;
+        client->snapshot.last_event_id++;
         break;
     case SAFETY_STM32_CODE_RESET_OK:
         client->snapshot.fault_code = 0;
+        client->snapshot.work_state = 1;
+        client->snapshot.actuator_flags |= (uint16_t)(SAFETY_ACT_DEVICE_POWER_ON |
+                                                      SAFETY_ACT_FAN_ON);
         client->snapshot.actuator_flags &= (uint16_t)~(SAFETY_ACT_ALARM_ON |
                                                        SAFETY_ACT_INTERLOCK |
                                                        SAFETY_ACT_RESET_WAIT);
         client->snapshot.last_event_type = code;
+        client->snapshot.last_event_id++;
         break;
     default:
         break;
@@ -216,13 +223,25 @@ static void safety_handle_stm32_code(SafetyInterlockClient *client,
 
 static void safety_handle_sensor_values(SafetyInterlockClient *client,
                                         const uint8_t *payload) {
+    static int64_t last_log_ms = 0;
+    int64_t now_ms = safety_mono_now_ms();
+    uint16_t smoke = safety_get_le16(&payload[0]);
+    uint16_t gas = safety_get_le16(&payload[2]);
+    int16_t temperature_x10 = (int16_t)safety_get_le16(&payload[4]);
+
     pthread_mutex_lock(&client->lock);
     client->snapshot.online = 1;
-    client->snapshot.smoke = safety_get_le16(&payload[0]);
-    client->snapshot.gas = safety_get_le16(&payload[2]);
-    client->snapshot.temperature_x10 = (int16_t)safety_get_le16(&payload[4]);
-    client->last_rx_mono_ms = safety_mono_now_ms();
+    client->snapshot.smoke = smoke;
+    client->snapshot.gas = gas;
+    client->snapshot.temperature_x10 = temperature_x10;
+    client->last_rx_mono_ms = now_ms;
     pthread_mutex_unlock(&client->lock);
+
+    if (now_ms - last_log_ms >= 5000) {
+        last_log_ms = now_ms;
+        printf("[Safety] STM32 sensor smoke=%u gas=%u temp=%.1f\n",
+               smoke, gas, (double)temperature_x10 / 10.0);
+    }
 }
 
 static void safety_handle_actuator_values(SafetyInterlockClient *client,
@@ -333,6 +352,20 @@ static void safety_read_serial(SafetyInterlockClient *client) {
     }
 }
 
+static void safety_send_link_heartbeat_if_due(SafetyInterlockClient *client,
+                                              int64_t now_ms) {
+    if (client == NULL || client->fd < 0) {
+        return;
+    }
+    if (client->last_heartbeat_ms != 0 &&
+        now_ms - client->last_heartbeat_ms < SAFETY_HEARTBEAT_INTERVAL_MS) {
+        return;
+    }
+    if (safety_send_simple_code(client, SAFETY_LINK_HEARTBEAT_CODE) == 0) {
+        client->last_heartbeat_ms = now_ms;
+    }
+}
+
 static void safety_update_online_state(SafetyInterlockClient *client,
                                        int64_t now_ms) {
     pthread_mutex_lock(&client->lock);
@@ -369,6 +402,7 @@ static void *safety_thread_main(void *arg) {
             if (poll(&pfd, 1, 20) > 0 && (pfd.revents & POLLIN)) {
                 safety_read_serial(client);
             }
+            safety_send_link_heartbeat_if_due(client, now_ms);
         } else {
             usleep(100000);
         }
@@ -486,7 +520,6 @@ static uint8_t safety_fusion_to_simple_code(uint8_t permit_decision,
                                             uint8_t stm32_action,
                                             uint8_t explain_code) {
     (void)risk_level;
-    (void)stm32_action;
 
     if (risk_type == SAFETY_RISK_TYPE_INTRUSION) {
         return SAFETY_CODE_INTRUSION;
@@ -506,12 +539,28 @@ static uint8_t safety_fusion_to_simple_code(uint8_t permit_decision,
         return SAFETY_CODE_FAULT;
     }
     if (risk_type == SAFETY_RISK_TYPE_STM32_LINK) {
-        return SAFETY_CODE_FAULT;
+        return SAFETY_CODE_RESERVED;
     }
     if (risk_type == SAFETY_RISK_TYPE_PPE) {
         return SAFETY_CODE_PPE_DENY;
     }
-    if (permit_decision == SAFETY_PERMIT_ALLOW ||
+
+    switch (stm32_action) {
+    case SAFETY_STM32_ACTION_KEEP_POWER_OFF:
+    case SAFETY_STM32_ACTION_CUT_POWER:
+    case SAFETY_STM32_ACTION_CUT_POWER_ALARM:
+    case SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM:
+    case SAFETY_STM32_ACTION_LOCKOUT_WAIT_RESET:
+        return SAFETY_CODE_RESERVED;
+    case SAFETY_STM32_ACTION_FAN_ON:
+    case SAFETY_STM32_ACTION_ALARM_ON:
+        return SAFETY_CODE_PPE_DENY;
+    case SAFETY_STM32_ACTION_KEEP:
+    default:
+        break;
+    }
+
+    if (permit_decision == SAFETY_PERMIT_ALLOW &&
         risk_type == SAFETY_RISK_TYPE_NONE) {
         return SAFETY_CODE_SAFE;
     }

@@ -96,6 +96,7 @@ int local_store_mark_video_segment_retry(LocalStore *store,
                                          int64_t segment_id,
                                          const char *last_error);
 int local_store_reset_uploading_video_segments(LocalStore *store);
+int local_store_recover_recording_video_segments(LocalStore *store);
 int local_store_debug_fetch_video_segment_by_id(LocalStore *store,
                                                 int64_t id,
                                                 LocalVideoSegmentRecord *record,

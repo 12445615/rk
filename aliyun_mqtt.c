@@ -76,13 +76,24 @@ void zone_runtime_reset(void);
 
 #define ZONE_RESULT_TOPIC "/k29ovUMboAH/0122/user/update"
 
-#define MQTT_REPORT_INTERVAL_SEC 10
+#define MQTT_REPORT_INTERVAL_SEC 3
 
 #define MQTT_OFFLINE_FLUSH_BATCH 10
 
 #define MQTT_AI_NONE_REPORT_INTERVAL_MS 60000
 
 #define MQTT_ZONE_STATUS_REPEAT_MS 10000
+
+#define MQTT_AI_STATE_FIRE_WORK_ZONE 5
+#define MQTT_AI_STATE_FIRE_OUT_ZONE 6
+#define MQTT_AI_STATE_INTRUSION 7
+
+static int mqtt_ai_state_should_alarm(int ai_detect_state) {
+    return ai_detect_state == MQTT_AI_STATE_FIRE_WORK_ZONE ||
+           ai_detect_state == MQTT_AI_STATE_FIRE_OUT_ZONE ||
+           ai_detect_state == MQTT_AI_STATE_INTRUSION;
+}
+
 
 
 
@@ -108,6 +119,8 @@ typedef struct {
 
     int ai_confidence;
 
+    int fire_confidence;
+
 } SensorSnapshot;
 
 
@@ -128,6 +141,7 @@ static int g_mqtt_force_offline = 0;
 static SafetyInterlockClient *g_safety_client = NULL;
 
 static int g_last_reported_ai_state = -1;
+static int g_last_reported_fire_value = 0;
 
 static int64_t g_last_ai_none_report_ms = 0;
 
@@ -282,6 +296,7 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
     snapshot->ai_detect_valid = 0;
     snapshot->ai_detect_state = 0;
     snapshot->ai_confidence = 0;
+    snapshot->fire_confidence = 0;
 
     if (g_safety_client != NULL &&
         safety_client_get_snapshot(g_safety_client, &stm32_snapshot) == 0) {
@@ -321,15 +336,36 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
         snapshot->ai_detect_valid = 1;
         snapshot->ai_detect_state = stm32_snapshot.ai_detect_state;
         snapshot->ai_confidence = stm32_snapshot.ai_confidence;
+        if (snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_WORK_ZONE ||
+            snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_OUT_ZONE) {
+            snapshot->fire_confidence = stm32_snapshot.ai_confidence;
+        }
     }
 
     pthread_mutex_lock(&g_immediate_ai_lock);
     if (g_immediate_ai_valid) {
         snapshot->ai_detect_valid = 1;
         snapshot->ai_detect_state = g_immediate_ai_state;
+        if (snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_WORK_ZONE ||
+            snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_OUT_ZONE) {
+            snapshot->fire_confidence = snapshot->ai_confidence;
+        }
         g_immediate_ai_valid = 0;
     }
     pthread_mutex_unlock(&g_immediate_ai_lock);
+
+    if (snapshot->ai_detect_valid &&
+        mqtt_ai_state_should_alarm(snapshot->ai_detect_state)) {
+        snapshot->alarm_status = 1;
+    }
+
+    if (snapshot->ai_detect_valid &&
+        (snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_WORK_ZONE ||
+         snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_OUT_ZONE)) {
+        snapshot->power_switch = 0;
+        snapshot->fan_status = 0;
+        snapshot->alarm_status = 1;
+    }
 
 }
 
@@ -356,6 +392,7 @@ static void build_debug_snapshot(SensorSnapshot *snapshot, int seq) {
     snapshot->ai_detect_state = seq % 8;
 
     snapshot->ai_confidence = 80;
+    snapshot->fire_confidence = 0;
 
 }
 
@@ -371,6 +408,9 @@ static int build_sensor_payload(char *payload,
     int power_switch = snapshot->power_switch ? 1 : 0;
     int fan_status = snapshot->fan_status ? 1 : 0;
     int ai_detect_state = snapshot->ai_detect_valid ? snapshot->ai_detect_state : 0;
+    int fire_value = (ai_detect_state == MQTT_AI_STATE_FIRE_WORK_ZONE ||
+                      ai_detect_state == MQTT_AI_STATE_FIRE_OUT_ZONE) ?
+                     snapshot->fire_confidence : 0;
 
     int len = snprintf(payload,
 
@@ -395,7 +435,8 @@ static int build_sensor_payload(char *payload,
                        "\"smokeconcentration\":%.2f,"
                        "\"temperature\":%.2f,"
 
-                       "\"AiDetectState\":%d"
+                       "\"AiDetectState\":%d,"
+                       "\"fire\":%d"
 
                        "},"
 
@@ -415,8 +456,10 @@ static int build_sensor_payload(char *payload,
 
                        (double)snapshot->smoke_concentration,
                        (double)snapshot->temp,
-                       ai_detect_state);
+                       ai_detect_state,
+                       fire_value);
     g_last_reported_ai_state = ai_detect_state;
+    g_last_reported_fire_value = fire_value;
     if (ai_detect_state == 0) {
         g_last_ai_none_report_ms = created_at_ms;
     } else {
@@ -733,6 +776,7 @@ static void publish_heartbeat(MQTTClient client,
                               int64_t created_at_ms) {
     SafetyStm32Snapshot stm32_snapshot;
     int stm32_online = 0;
+    int alarm_state = mqtt_ai_state_should_alarm(g_last_reported_ai_state) ? 1 : 0;
     int rc;
     char payload[256];
 
@@ -743,12 +787,24 @@ static void publish_heartbeat(MQTTClient client,
     if (g_safety_client != NULL &&
         safety_client_get_snapshot(g_safety_client, &stm32_snapshot) == 0) {
         stm32_online = stm32_snapshot.online ? 1 : 0;
+        if (stm32_snapshot.fault_code != 0 ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_INTERLOCK ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_EMERGENCY_STOP ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_FAULT ||
+            stm32_snapshot.last_event_type == SAFETY_STM32_CODE_RESET_WAIT ||
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_ALARM_ON) ||
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_RESET_WAIT)) {
+            alarm_state = 1;
+        }
     }
 
     snprintf(payload, sizeof(payload),
              "{\"cmd\":\"heartbeat\",\"online\":1,"
-             "\"stm32_online\":%d,\"ts\":%lld}",
+             "\"stm32_online\":%d,\"AiDetectState\":%d,\"AlarmState\":%d,\"fire\":%d,\"ts\":%lld}",
              stm32_online,
+             g_last_reported_ai_state,
+             alarm_state,
+             g_last_reported_fire_value,
              (long long)created_at_ms);
 
     rc = publish_payload(client, HEARTBEAT_TOPIC, payload);

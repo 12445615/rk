@@ -60,6 +60,8 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     s->height = height;
 
     s->frame_pts = 0;
+    s->side_fmt_ctx = NULL;
+    s->side_video_st = NULL;
 
     
 
@@ -265,6 +267,107 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
 
 
 
+
+static int streamer_write_side_packet(FFmpegStreamer *s, const AVPacket *pkt)
+{
+    AVPacket side_pkt;
+    int ret;
+
+    if (s == NULL || s->side_fmt_ctx == NULL || s->side_video_st == NULL || pkt == NULL) {
+        return 0;
+    }
+
+    av_init_packet(&side_pkt);
+    ret = av_packet_ref(&side_pkt, pkt);
+    if (ret < 0) {
+        return ret;
+    }
+
+    av_packet_rescale_ts(&side_pkt, s->video_st->time_base, s->side_video_st->time_base);
+    side_pkt.stream_index = s->side_video_st->index;
+    ret = av_write_frame(s->side_fmt_ctx, &side_pkt);
+    av_packet_unref(&side_pkt);
+    return ret;
+}
+
+int streamer_start_side_record(FFmpegStreamer *s, const char *filename)
+{
+    AVFormatContext *fmt = NULL;
+    AVStream *st = NULL;
+    int ret;
+
+    if (s == NULL || filename == NULL || filename[0] == '\0') {
+        return -1;
+    }
+    if (s->side_fmt_ctx != NULL) {
+        return 0;
+    }
+    if (s->fmt_ctx == NULL || s->video_st == NULL || s->enc_ctx == NULL) {
+        return -1;
+    }
+
+    ret = avformat_alloc_output_context2(&fmt, NULL, "mpegts", filename);
+    if (ret < 0 || fmt == NULL) {
+        fprintf(stderr, "[Encoder] side record alloc output failed: %s\n", filename);
+        return -1;
+    }
+
+    fmt->flags |= AVFMT_FLAG_FLUSH_PACKETS;
+    st = avformat_new_stream(fmt, NULL);
+    if (st == NULL) {
+        avformat_free_context(fmt);
+        return -1;
+    }
+    ret = avcodec_parameters_copy(st->codecpar, s->video_st->codecpar);
+    if (ret < 0) {
+        avformat_free_context(fmt);
+        return -1;
+    }
+    st->codecpar->codec_tag = 0;
+    st->time_base = s->video_st->time_base;
+
+    if (!(fmt->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open2(&fmt->pb, filename, AVIO_FLAG_WRITE, NULL, NULL);
+        if (ret < 0) {
+            fprintf(stderr, "[Encoder] side record open failed: %s ret=%d\n", filename, ret);
+            avformat_free_context(fmt);
+            return -1;
+        }
+    }
+
+    ret = avformat_write_header(fmt, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "[Encoder] side record header failed: %s ret=%d\n", filename, ret);
+        if (!(fmt->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&fmt->pb);
+        }
+        avformat_free_context(fmt);
+        return -1;
+    }
+
+    s->side_fmt_ctx = fmt;
+    s->side_video_st = st;
+    printf("[Encoder] side record started: %s\n", filename);
+    return 0;
+}
+
+int streamer_stop_side_record(FFmpegStreamer *s)
+{
+    if (s == NULL || s->side_fmt_ctx == NULL) {
+        return 0;
+    }
+
+    av_write_trailer(s->side_fmt_ctx);
+    if (!(s->side_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        avio_closep(&s->side_fmt_ctx->pb);
+    }
+    avformat_free_context(s->side_fmt_ctx);
+    s->side_fmt_ctx = NULL;
+    s->side_video_st = NULL;
+    printf("[Encoder] side record stopped\n");
+    return 0;
+}
+
 int streamer_push(FFmpegStreamer *s, uint8_t *nv12_data)
 
 {
@@ -328,6 +431,7 @@ int streamer_push(FFmpegStreamer *s, uint8_t *nv12_data)
         // ==== ���Ŀ��ӳ����� 3�����ٽ�֯�ȴ���Ƶ��ֱ�ӱ����������� ====
 
         av_write_frame(s->fmt_ctx, pkt);
+        streamer_write_side_packet(s, pkt);
 
         
 
@@ -1002,6 +1106,10 @@ int streamer_push_zerocopy_overlay(FFmpegStreamer *s, int dma_fd, const DetectSh
             av_packet_free(&pkt);
             return ret;
         }
+        ret = streamer_write_side_packet(s, pkt);
+        if (ret < 0) {
+            fprintf(stderr, "[Encoder] side record packet write failed: %d\n", ret);
+        }
 
         av_packet_unref(pkt);
 
@@ -1043,6 +1151,8 @@ int streamer_clean(FFmpegStreamer *s)
 {
 
     if (!s) return -1;
+
+    streamer_stop_side_record(s);
 
     if (s->fmt_ctx) av_write_trailer(s->fmt_ctx);
 

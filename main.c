@@ -85,8 +85,15 @@
 #define SAFETY_AI_FLAG_NO_VEST     (1u << 3)
 #define SAFETY_AI_FLAG_FIRE        (1u << 4)
 #define SAFETY_AI_FLAG_FIRE_OUT    (1u << 5)
+#define SAFETY_RESET_FIRE_IGNORE_MS 5000
 #define SAFETY_AI_FLAG_INTRUSION   (1u << 6)
+#define SAFETY_AI_FLAG_ZONE1_BUSY  (1u << 7)
 #define SAFETY_AI_FLAG_PERSON      (1u << 8)
+#define SAFETY_AI_FLAG_ZONE2_BUSY  (1u << 9)
+#define SAFETY_AI_FLAG_ZONE1_PPE_BAD (1u << 12)
+#define SAFETY_AI_FLAG_ZONE2_PPE_BAD (1u << 13)
+#define SAFETY_AI_FLAG_ZONE1_READY (1u << 10)
+#define SAFETY_AI_FLAG_ZONE2_READY (1u << 11)
 
 #define AI_DETECT_STATE_NONE 0
 #define AI_DETECT_STATE_PPE_OK 1
@@ -731,6 +738,7 @@ typedef struct {
     int64_t ppe_first_seen_ms;
     int64_t intrusion_first_seen_ms;
     int64_t sensor_baseline_ms;
+    int64_t fire_env_confirm_until_ms;
     uint16_t baseline_smoke;
     int16_t baseline_temperature_x10;
     int fire_locked;
@@ -739,7 +747,10 @@ typedef struct {
     int fault_locked;
     int suppress_fusion_send;
     int manual_reset_override;
+    int64_t fire_ignore_until_ms;
     uint16_t last_reset_ok_event_id;
+    int zone1_power_enabled;
+    int zone2_power_enabled;
     int initialized;
 } SafetyRuntimeState;
 
@@ -819,17 +830,16 @@ static void safety_build_ai_status(DetectSharedState *shared,
     int has_no_vest = 0;
     int has_person = 0;
     int has_fire = 0;
-    int has_fire_in_work_zone = 0;
-    int has_fire_out_of_work_zone = 0;
-    int has_intrusion = 0;
+    int zone1_person_count = 0;
+    int zone2_person_count = 0;
     int dynamic_zone_detected;
-    ZoneRect work_zone;
-    ZoneRect danger_zone;
+    ZoneRect work_zone1;
+    ZoneRect work_zone2;
 
-    dynamic_zone_detected = zone_runtime_get_detected(&work_zone, &danger_zone);
+    dynamic_zone_detected = zone_runtime_get_detected(&work_zone1, &work_zone2);
     if (!dynamic_zone_detected) {
-        memset(&work_zone, 0, sizeof(work_zone));
-        memset(&danger_zone, 0, sizeof(danger_zone));
+        memset(&work_zone1, 0, sizeof(work_zone1));
+        memset(&work_zone2, 0, sizeof(work_zone2));
     }
 
     if (!detect_snapshot_read(shared, &snapshot) ||
@@ -862,23 +872,17 @@ static void safety_build_ai_status(DetectSharedState *shared,
             has_no_vest = 1;
         } else if (strcmp(name, "person") == 0) {
             has_person = 1;
-            if (danger_zone.valid &&
-                safety_box_bottom_in_zone(&snapshot.boxes[i], &danger_zone) &&
-                (dynamic_zone_detected ||
-                 !safety_box_bottom_in_zone(&snapshot.boxes[i], &work_zone))) {
-                has_intrusion = 1;
+            if (work_zone1.valid &&
+                safety_box_bottom_in_zone(&snapshot.boxes[i], &work_zone1)) {
+                zone1_person_count++;
+            } else if (work_zone2.valid &&
+                       safety_box_bottom_in_zone(&snapshot.boxes[i], &work_zone2)) {
+                zone2_person_count++;
             }
         } else if (strcmp(name, "fire") == 0) {
             has_fire = 1;
             if (score_percent > fire_confidence) {
                 fire_confidence = score_percent;
-            }
-            if (work_zone.valid) {
-                if (safety_box_center_in_zone(&snapshot.boxes[i], &work_zone)) {
-                    has_fire_in_work_zone = 1;
-                } else {
-                    has_fire_out_of_work_zone = 1;
-                }
             }
         }
     }
@@ -892,19 +896,24 @@ static void safety_build_ai_status(DetectSharedState *shared,
     if (has_no_vest) {
         flags |= SAFETY_AI_FLAG_NO_VEST;
     }
-    if (has_fire && !work_zone.valid) {
-        /* 未配置工作区时保持旧逻辑：bit4 作为通用 fire_detected�?*/
-        flags |= SAFETY_AI_FLAG_FIRE;
-    } else {
-        if (has_fire_in_work_zone) {
-            flags |= SAFETY_AI_FLAG_FIRE;
-        }
-        if (has_fire_out_of_work_zone) {
-            flags |= SAFETY_AI_FLAG_FIRE_OUT;
-        }
+    if (has_fire) {
+        flags |= SAFETY_AI_FLAG_FIRE_OUT;
     }
-    if (has_intrusion) {
-        flags |= SAFETY_AI_FLAG_INTRUSION;
+    if (zone1_person_count == 1) {
+        flags |= SAFETY_AI_FLAG_ZONE1_READY;
+    } else if (zone1_person_count >= 2) {
+        flags |= SAFETY_AI_FLAG_INTRUSION | SAFETY_AI_FLAG_ZONE1_BUSY;
+    }
+    if (zone2_person_count == 1) {
+        flags |= SAFETY_AI_FLAG_ZONE2_READY;
+    } else if (zone2_person_count >= 2) {
+        flags |= SAFETY_AI_FLAG_INTRUSION | SAFETY_AI_FLAG_ZONE2_BUSY;
+    }
+    if ((has_no_helmet || has_no_vest) && zone1_person_count > 0) {
+        flags |= SAFETY_AI_FLAG_ZONE1_PPE_BAD;
+    }
+    if ((has_no_helmet || has_no_vest) && zone2_person_count > 0) {
+        flags |= SAFETY_AI_FLAG_ZONE2_PPE_BAD;
     }
     if ((has_helmet || !has_person) && has_vest && !has_no_helmet && !has_no_vest) {
         flags |= SAFETY_AI_FLAG_PPE_OK;
@@ -912,6 +921,40 @@ static void safety_build_ai_status(DetectSharedState *shared,
 
     *ai_flags_out = flags;
     *ai_confidence_out = has_fire ? fire_confidence : confidence;
+}
+
+static uint8_t safety_zone_power_action(const SafetyRuntimeState *state, int alarm) {
+    int zone1_on = state != NULL && state->zone1_power_enabled;
+    int zone2_on = state != NULL && state->zone2_power_enabled;
+
+    if (alarm && zone1_on && zone2_on) {
+        return SAFETY_STM32_ACTION_ALARM_KEEP_POWER;
+    }
+    if (zone1_on && zone2_on) {
+        return SAFETY_STM32_ACTION_ENABLE_ZONE12;
+    }
+    if (zone1_on) {
+        return alarm ? SAFETY_STM32_ACTION_CUT_ZONE2_ALARM : SAFETY_STM32_ACTION_ENABLE_ZONE1;
+    }
+    if (zone2_on) {
+        return alarm ? SAFETY_STM32_ACTION_CUT_ZONE1_ALARM : SAFETY_STM32_ACTION_ENABLE_ZONE2;
+    }
+    return alarm ? SAFETY_STM32_ACTION_KEEP_POWER_OFF : SAFETY_STM32_ACTION_STANDBY_POWER_OFF;
+}
+
+static void safety_update_sensor_baseline(SafetyRuntimeState *state,
+                                          const SafetyStm32Snapshot *stm32,
+                                          int64_t frame_mono_ms) {
+    if (state == NULL || stm32 == NULL || !stm32->online) {
+        return;
+    }
+
+    if (state->sensor_baseline_ms == 0 ||
+        frame_mono_ms - state->sensor_baseline_ms > SAFETY_CONFIRM_DELAY_MS) {
+        state->sensor_baseline_ms = frame_mono_ms;
+        state->baseline_smoke = stm32->smoke;
+        state->baseline_temperature_x10 = stm32->temperature_x10;
+    }
 }
 
 static int safety_sensor_rise_high(SafetyRuntimeState *state,
@@ -924,11 +967,8 @@ static int safety_sensor_rise_high(SafetyRuntimeState *state,
         return 0;
     }
 
-    if (state->sensor_baseline_ms == 0 ||
-        frame_mono_ms - state->sensor_baseline_ms > SAFETY_CONFIRM_DELAY_MS) {
-        state->sensor_baseline_ms = frame_mono_ms;
-        state->baseline_smoke = stm32->smoke;
-        state->baseline_temperature_x10 = stm32->temperature_x10;
+    if (state->sensor_baseline_ms == 0) {
+        safety_update_sensor_baseline(state, stm32, frame_mono_ms);
         return 0;
     }
 
@@ -958,6 +998,12 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
     int temp_high_x10 = env_to_positive_int(SAFETY_TEMP_HIGH_X10_ENV, SAFETY_TEMP_HIGH_X10_DEFAULT);
     int ppe_bad = (ai_flags & (SAFETY_AI_FLAG_NO_HELMET | SAFETY_AI_FLAG_NO_VEST)) != 0;
     int intrusion = (ai_flags & SAFETY_AI_FLAG_INTRUSION) != 0;
+    int zone1_busy = (ai_flags & SAFETY_AI_FLAG_ZONE1_BUSY) != 0;
+    int zone2_busy = (ai_flags & SAFETY_AI_FLAG_ZONE2_BUSY) != 0;
+    int zone1_ready = (ai_flags & SAFETY_AI_FLAG_ZONE1_READY) != 0;
+    int zone2_ready = (ai_flags & SAFETY_AI_FLAG_ZONE2_READY) != 0;
+    int zone1_ppe_bad = (ai_flags & SAFETY_AI_FLAG_ZONE1_PPE_BAD) != 0;
+    int zone2_ppe_bad = (ai_flags & SAFETY_AI_FLAG_ZONE2_PPE_BAD) != 0;
     int stm32_online = stm32 != NULL && stm32->online;
     int reset_ok = stm32 != NULL &&
                    stm32->last_event_type == SAFETY_STM32_CODE_RESET_OK &&
@@ -966,6 +1012,14 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
     int zone_detected = zone_runtime_get_detected(NULL, NULL);
     int zone_blocked = mqtt_get_zone_blocked();
     int zone_confirm_enabled = mqtt_get_zone_confirm_enabled();
+    int env_abs_high = stm32_online &&
+                       (stm32->smoke >= (uint16_t)smoke_high ||
+                        stm32->gas >= (uint16_t)gas_high ||
+                        stm32->temperature_x10 >= temp_high_x10);
+
+    if (state != NULL && env_abs_high) {
+        state->fire_env_confirm_until_ms = frame_mono_ms + 8000;
+    }
 
     *permit_decision = SAFETY_PERMIT_DENY;
     *risk_level = SAFETY_RISK_WARNING;
@@ -992,19 +1046,45 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         state->last_stm32_action = 0xFF;
         state->last_explain_code = 0xFF;
         state->manual_reset_override = 1;
+        state->fire_ignore_until_ms = frame_mono_ms + SAFETY_RESET_FIRE_IGNORE_MS;
+        state->fire_env_confirm_until_ms = 0;
         state->last_reset_ok_event_id = stm32->last_event_id;
-        printf("[Safety] STM32 reset OK event=%u: enter manual reset override\n", stm32->last_event_id);
+        state->zone1_power_enabled = 1;
+        state->zone2_power_enabled = 1;
+        printf("[Safety] STM32 reset OK event=%u: ignore fire for %d ms\n",
+               stm32->last_event_id, SAFETY_RESET_FIRE_IGNORE_MS);
         *permit_decision = SAFETY_PERMIT_ALLOW;
         *risk_level = SAFETY_RISK_SAFE;
         *risk_type = SAFETY_RISK_TYPE_NONE;
         *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *stm32_action = safety_zone_power_action(state, 0);
         *explain_code = 88;
         return;
     }
 
+    if (state != NULL && state->fire_ignore_until_ms > 0) {
+        if (frame_mono_ms < state->fire_ignore_until_ms) {
+            if (ai_flags & (SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT)) {
+                ai_flags &= (uint16_t)~(SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT);
+                state->fire_locked = 0;
+                state->fire_lock_sent = 0;
+                printf("[Safety] reset fire ignore active: %lld ms left\n",
+                       (long long)(state->fire_ignore_until_ms - frame_mono_ms));
+            }
+        } else {
+            state->fire_ignore_until_ms = 0;
+        }
+    }
+
+    if ((ai_flags & (SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT)) == 0) {
+        safety_update_sensor_baseline(state, stm32, frame_mono_ms);
+    }
+
     if (state != NULL && state->manual_reset_override) {
-        if ((ai_flags & (SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT | SAFETY_AI_FLAG_INTRUSION)) == 0 &&
+        if ((ai_flags & (SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT |
+                         SAFETY_AI_FLAG_INTRUSION | SAFETY_AI_FLAG_NO_HELMET |
+                         SAFETY_AI_FLAG_NO_VEST | SAFETY_AI_FLAG_ZONE1_BUSY |
+                         SAFETY_AI_FLAG_ZONE2_BUSY)) == 0 &&
             !(stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_EMERGENCY_STOP) &&
             !(stm32_online && stm32->last_event_type == SAFETY_STM32_CODE_FAULT) &&
             !(stm32_online && stm32->fault_code != 0)) {
@@ -1012,11 +1092,11 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
             *risk_level = SAFETY_RISK_SAFE;
             *risk_type = SAFETY_RISK_TYPE_NONE;
             *voice_action = SAFETY_VOICE_NONE;
-            *stm32_action = SAFETY_STM32_ACTION_KEEP;
+            *stm32_action = safety_zone_power_action(state, 0);
             *explain_code = 88;
             return;
         }
-        printf("[Safety] manual reset override exit: new high-risk event detected\n");
+        printf("[Safety] manual reset override exit: new event detected\n");
         state->manual_reset_override = 0;
     }
 
@@ -1078,9 +1158,11 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
 
     if ((ai_flags & SAFETY_AI_FLAG_VALID) == 0) {
         if (!stm32_online) {
+            *permit_decision = SAFETY_PERMIT_ALLOW;
+            *risk_level = SAFETY_RISK_WARNING;
             *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
             *voice_action = SAFETY_VOICE_NONE;
-            *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+            *stm32_action = SAFETY_STM32_ACTION_STANDBY_POWER_OFF;
             *explain_code = 81;
             return;
         }
@@ -1088,12 +1170,28 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         *risk_level = SAFETY_RISK_SAFE;
         *risk_type = SAFETY_RISK_TYPE_NONE;
         *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *stm32_action = safety_zone_power_action(state, 0);
         *explain_code = 12;
         return;
     }
 
-    if (stm32_online && stm32->smoke >= (uint16_t)smoke_high) {
+    if (ai_flags & (SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT)) {
+        if (safety_sensor_rise_high(state, stm32, frame_mono_ms) ||
+            env_abs_high ||
+            (state != NULL && state->fire_env_confirm_until_ms > frame_mono_ms)) {
+            if (state != NULL) {
+                state->fire_locked = 1;
+            }
+            *risk_level = SAFETY_RISK_CRITICAL;
+            *risk_type = SAFETY_RISK_TYPE_FIRE;
+            *voice_action = SAFETY_VOICE_FIRE_WARNING;
+            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+            *explain_code = 42;
+            return;
+        }
+    }
+
+    if (0 && stm32_online && stm32->smoke >= (uint16_t)smoke_high) {
         *risk_level = SAFETY_RISK_CRITICAL;
         *risk_type = SAFETY_RISK_TYPE_ENV;
         *voice_action = SAFETY_VOICE_ENV_WARNING;
@@ -1101,7 +1199,7 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         *explain_code = 61;
         return;
     }
-    if (stm32_online && stm32->gas >= (uint16_t)gas_high) {
+    if (0 && stm32_online && stm32->gas >= (uint16_t)gas_high) {
         *risk_level = SAFETY_RISK_CRITICAL;
         *risk_type = SAFETY_RISK_TYPE_ENV;
         *voice_action = SAFETY_VOICE_ENV_WARNING;
@@ -1109,7 +1207,7 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         *explain_code = 62;
         return;
     }
-    if (stm32_online && stm32->temperature_x10 >= temp_high_x10) {
+    if (0 && stm32_online && stm32->temperature_x10 >= temp_high_x10) {
         *risk_level = SAFETY_RISK_CRITICAL;
         *risk_type = SAFETY_RISK_TYPE_ENV;
         *voice_action = SAFETY_VOICE_ENV_WARNING;
@@ -1128,43 +1226,43 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
 
     if (intrusion) {
         *risk_level = SAFETY_RISK_DANGER;
+        *risk_type = SAFETY_RISK_TYPE_INTRUSION;
         *voice_action = SAFETY_VOICE_INTRUSION_WARNING;
-        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_ALARM;
-        *explain_code = 51;
-        if (state != NULL &&
-            frame_mono_ms - state->intrusion_first_seen_ms >= SAFETY_CONFIRM_DELAY_MS) {
-            *risk_type = SAFETY_RISK_TYPE_INTRUSION;
+        if (zone1_busy && zone2_busy) {
+            *stm32_action = SAFETY_STM32_ACTION_CUT_ZONE12_ALARM;
+            *explain_code = 53;
+        } else if (zone2_busy) {
+            *stm32_action = SAFETY_STM32_ACTION_CUT_ZONE2_ALARM;
+            *explain_code = 52;
         } else {
-            *risk_type = SAFETY_RISK_TYPE_NONE;
-            *stm32_action = SAFETY_STM32_ACTION_KEEP;
+            *stm32_action = SAFETY_STM32_ACTION_CUT_ZONE1_ALARM;
+            *explain_code = 51;
+        }
+        return;
+    }
+
+
+    if (ai_flags & (SAFETY_AI_FLAG_FIRE | SAFETY_AI_FLAG_FIRE_OUT)) {
+        if (safety_sensor_rise_high(state, stm32, frame_mono_ms) ||
+            env_abs_high ||
+            (state != NULL && state->fire_env_confirm_until_ms > frame_mono_ms)) {
             if (state != NULL) {
-                state->suppress_fusion_send = 1;
+                state->fire_locked = 1;
             }
+            *risk_level = SAFETY_RISK_CRITICAL;
+            *risk_type = SAFETY_RISK_TYPE_FIRE;
+            *voice_action = SAFETY_VOICE_FIRE_WARNING;
+            *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
+            *explain_code = 42;
+            return;
         }
-        return;
-    }
 
-    if (ai_flags & SAFETY_AI_FLAG_FIRE_OUT) {
-        if (state != NULL) {
-            state->fire_locked = 1;
-        }
-        *risk_level = SAFETY_RISK_CRITICAL;
-        *risk_type = SAFETY_RISK_TYPE_FIRE;
-        *voice_action = SAFETY_VOICE_FIRE_WARNING;
-        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
-        *explain_code = 42;
-        return;
-    }
-
-    if (ai_flags & SAFETY_AI_FLAG_FIRE) {
-        if (state != NULL) {
-            state->fire_locked = 1;
-        }
-        *risk_level = SAFETY_RISK_CRITICAL;
-        *risk_type = SAFETY_RISK_TYPE_FIRE;
-        *voice_action = SAFETY_VOICE_FIRE_WARNING;
-        *stm32_action = SAFETY_STM32_ACTION_CUT_POWER_FAN_ALARM;
-        *explain_code = 42;
+        *permit_decision = SAFETY_PERMIT_ALLOW;
+        *risk_level = SAFETY_RISK_SAFE;
+        *risk_type = SAFETY_RISK_TYPE_NONE;
+        *voice_action = SAFETY_VOICE_NONE;
+        *stm32_action = safety_zone_power_action(state, 0);
+        *explain_code = 43;
         return;
     }
 
@@ -1174,7 +1272,15 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         }
         *risk_type = SAFETY_RISK_TYPE_PPE;
         *voice_action = SAFETY_VOICE_PPE_WARNING;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+        if (state != NULL) {
+            if (zone1_ppe_bad) {
+                state->zone1_power_enabled = 0;
+            }
+            if (zone2_ppe_bad) {
+                state->zone2_power_enabled = 0;
+            }
+        }
+        *stm32_action = safety_zone_power_action(state, 1);
         if ((ai_flags & SAFETY_AI_FLAG_NO_HELMET) && (ai_flags & SAFETY_AI_FLAG_NO_VEST)) {
             *explain_code = 24;
         } else if (ai_flags & SAFETY_AI_FLAG_NO_VEST) {
@@ -1185,7 +1291,7 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         if (state != NULL &&
             frame_mono_ms - state->ppe_first_seen_ms < SAFETY_CONFIRM_DELAY_MS) {
             *risk_type = SAFETY_RISK_TYPE_NONE;
-            *stm32_action = SAFETY_STM32_ACTION_KEEP;
+            *stm32_action = safety_zone_power_action(state, 0);
             state->suppress_fusion_send = 1;
         }
         return;
@@ -1194,19 +1300,29 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
     }
 
     if (!stm32_online) {
+        *permit_decision = SAFETY_PERMIT_ALLOW;
+        *risk_level = SAFETY_RISK_WARNING;
         *risk_type = SAFETY_RISK_TYPE_STM32_LINK;
         *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP_POWER_OFF;
+        *stm32_action = SAFETY_STM32_ACTION_STANDBY_POWER_OFF;
         *explain_code = 81;
         return;
     }
 
     if (ai_flags & SAFETY_AI_FLAG_PPE_OK) {
+        if (state != NULL) {
+            if (zone1_ready) {
+                state->zone1_power_enabled = 1;
+            }
+            if (zone2_ready) {
+                state->zone2_power_enabled = 1;
+            }
+        }
         *permit_decision = SAFETY_PERMIT_ALLOW;
         *risk_level = SAFETY_RISK_SAFE;
         *risk_type = SAFETY_RISK_TYPE_NONE;
         *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *stm32_action = safety_zone_power_action(state, 0);
         *explain_code = 11;
         return;
     }
@@ -1216,7 +1332,7 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
         *risk_level = SAFETY_RISK_SAFE;
         *risk_type = SAFETY_RISK_TYPE_NONE;
         *voice_action = SAFETY_VOICE_NONE;
-        *stm32_action = SAFETY_STM32_ACTION_KEEP;
+        *stm32_action = safety_zone_power_action(state, 0);
         *explain_code = 12;
         return;
     }
@@ -1225,7 +1341,7 @@ static void safety_evaluate_fusion(SafetyRuntimeState *state,
     *risk_level = SAFETY_RISK_SAFE;
     *risk_type = SAFETY_RISK_TYPE_NONE;
     *voice_action = SAFETY_VOICE_NONE;
-    *stm32_action = SAFETY_STM32_ACTION_KEEP;
+    *stm32_action = safety_zone_power_action(state, 0);
     *explain_code = 13;
 }
 
@@ -1277,15 +1393,13 @@ static void safety_audio_update_from_fusion(const SafetyRuntimeState *state,
             command = 1;
         }
     } else if (state->voice_action == SAFETY_VOICE_INTRUSION_WARNING) {
-        command = 4;
-    } else if (state->voice_action == SAFETY_VOICE_PPE_WARNING) {
-        if (state->explain_code == 22) {
+        if (state->explain_code == 52) {
+            command = 3;
+        } else {
             command = 2;
-        } else if (state->explain_code == 21) {
-            command = 3;
-        } else if (state->explain_code == 24) {
-            command = 3;
         }
+    } else if (state->voice_action == SAFETY_VOICE_PPE_WARNING) {
+        command = 4;
     }
 
     audio_alert_send_command(command, frame_wall_ms);
@@ -1642,7 +1756,7 @@ static int child_close_record_segment(ChildOutputCtx *ctx, int broken) {
     }
 
     if (ctx->record_segment_id > 0) {
-        if (!ctx->record_segment_has_target && !broken) {
+        if (!ctx->record_segment_has_target && !broken && ctx->mode != CHILD_OUTPUT_FILE) {
             if (ctx->record_segment_path[0] != '\0' && unlink(ctx->record_segment_path) != 0 && errno != ENOENT) {
                 fprintf(stderr, "[Child] Failed to delete non-event segment %s: %s\n",
                         ctx->record_segment_path, strerror(errno));
@@ -1669,7 +1783,8 @@ static int child_close_record_segment(ChildOutputCtx *ctx, int broken) {
             if (rc != 0) {
                 fprintf(stderr, "[Child] Failed to finish target segment metadata: %d\n", rc);
             }
-            printf("[Child] Event segment kept: %s size=%lld\n",
+            printf("[%s] segment kept: %s size=%lld\n",
+                   ctx->record_segment_has_target ? "Child] Event" : "Child] Offline",
                    ctx->record_segment_path, (long long)size_bytes);
         }
     }

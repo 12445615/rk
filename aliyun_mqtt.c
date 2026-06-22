@@ -107,6 +107,10 @@ typedef struct {
 
     int power_switch;
 
+    int power_switch1;
+
+    int power_switch2;
+
     int fan_status;
 
     float combustible_gas;
@@ -290,6 +294,8 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
     pthread_mutex_unlock(&g_sensor_data.lock);
 
     snapshot->power_switch = snapshot->alarm_status ? 0 : 1;
+    snapshot->power_switch1 = snapshot->power_switch;
+    snapshot->power_switch2 = snapshot->power_switch;
     snapshot->fan_status = snapshot->alarm_status ? 1 : 0;
     snapshot->combustible_gas = (float)snapshot->ppm;
     snapshot->smoke_concentration = (float)snapshot->ppm;
@@ -304,15 +310,21 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
     }
 
     if (has_stm32_snapshot && stm32_snapshot.actuator_feedback_valid) {
-        snapshot->power_switch =
-            (stm32_snapshot.actuator_flags & SAFETY_ACT_DEVICE_POWER_ON) ? 1 : 0;
+        snapshot->power_switch1 =
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_POWER1_ON) ? 1 : 0;
+        snapshot->power_switch2 =
+            (stm32_snapshot.actuator_flags & SAFETY_ACT_POWER2_ON) ? 1 : 0;
+        snapshot->power_switch = (snapshot->power_switch1 && snapshot->power_switch2) ? 1 : 0;
         snapshot->fan_status =
             (stm32_snapshot.actuator_flags & SAFETY_ACT_FAN_ON) ? 1 : 0;
         snapshot->alarm_status =
             (stm32_snapshot.actuator_flags & SAFETY_ACT_ALARM_ON) ? 1 : 0;
     } else if (has_stm32_snapshot && stm32_snapshot.expected_actuator_valid) {
-        snapshot->power_switch =
-            (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_DEVICE_POWER_ON) ? 1 : 0;
+        snapshot->power_switch1 =
+            (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_POWER1_ON) ? 1 : 0;
+        snapshot->power_switch2 =
+            (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_POWER2_ON) ? 1 : 0;
+        snapshot->power_switch = (snapshot->power_switch1 && snapshot->power_switch2) ? 1 : 0;
         snapshot->fan_status =
             (stm32_snapshot.expected_actuator_flags & SAFETY_ACT_FAN_ON) ? 1 : 0;
         snapshot->alarm_status =
@@ -363,6 +375,8 @@ static void read_sensor_snapshot(SensorSnapshot *snapshot) {
         (snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_WORK_ZONE ||
          snapshot->ai_detect_state == MQTT_AI_STATE_FIRE_OUT_ZONE)) {
         snapshot->power_switch = 0;
+        snapshot->power_switch1 = 0;
+        snapshot->power_switch2 = 0;
         snapshot->fan_status = 0;
         snapshot->alarm_status = 1;
     }
@@ -380,6 +394,8 @@ static void build_debug_snapshot(SensorSnapshot *snapshot, int seq) {
     snapshot->alarm_status = seq % 2;
 
     snapshot->power_switch = snapshot->alarm_status ? 0 : 1;
+    snapshot->power_switch1 = snapshot->power_switch;
+    snapshot->power_switch2 = snapshot->power_switch;
 
     snapshot->fan_status = snapshot->alarm_status ? 1 : 0;
 
@@ -406,6 +422,8 @@ static int build_sensor_payload(char *payload,
 
     int alarm_state = snapshot->alarm_status ? 1 : 0;
     int power_switch = snapshot->power_switch ? 1 : 0;
+    int power_switch1 = snapshot->power_switch1 ? 1 : 0;
+    int power_switch2 = snapshot->power_switch2 ? 1 : 0;
     int fan_status = snapshot->fan_status ? 1 : 0;
     int ai_detect_state = snapshot->ai_detect_valid ? snapshot->ai_detect_state : 0;
     int fire_value = (ai_detect_state == MQTT_AI_STATE_FIRE_WORK_ZONE ||
@@ -425,6 +443,8 @@ static int build_sensor_payload(char *payload,
                        "\"params\":{"
 
                        "\"PowerSwitch\":%d,"
+                       "\"PowerSwitch1\":%d,"
+                       "\"PowerSwitch2\":%d,"
 
                        "\"Fanstatus\":%d,"
 
@@ -447,6 +467,8 @@ static int build_sensor_payload(char *payload,
                        (long long)created_at_ms,
 
                        power_switch,
+                       power_switch1,
+                       power_switch2,
 
                        fan_status,
 

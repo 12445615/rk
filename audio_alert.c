@@ -44,9 +44,9 @@ void audio_alert_send_command(int command, int64_t now_ms) {
     g_last_audio_ms = now_ms;
 
     if (command == 1) printf("[Audio Alert] Fire Warning!\n");
-    else if (command == 2) printf("[Audio Alert] No Vest Warning!\n");
-    else if (command == 3) printf("[Audio Alert] No Helmet Warning!\n");
-    else if (command == 4) printf("[Audio Alert] Intrusion Warning!\n");
+    else if (command == 2) printf("[Audio Alert] Work Zone 1 Warning!\n");
+    else if (command == 3) printf("[Audio Alert] Work Zone 2 Warning!\n");
+    else if (command == 4) printf("[Audio Alert] PPE Warning!\n");
     else printf("[Audio Alert] Command %d\n", command);
 
     if (g_fifo_fd >= 0) {

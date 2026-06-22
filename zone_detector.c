@@ -14,16 +14,16 @@
 #define ZONE_EDGE_BAND_PX 12
 #define ZONE_EDGE_MIN_RATIO 0.30f
 #define ZONE_BLACK_EDGE_MIN_RATIO 0.20f
-#define ZONE_BLACK_MAX_Y 74
-#define ZONE_BLACK_MAX_CHROMA_DELTA 20
+#define ZONE_BLACK_MAX_Y 94
+#define ZONE_BLACK_MAX_CHROMA_DELTA 32
 #define ZONE_BLACK_MIN_AREA 12000.0f
 #define ZONE_BLACK_MAX_AREA 900000.0f
 #define ZONE_BLACK_BORDER_MARGIN 8
 #define ZONE_BLACK_SEGMENT_MIN_PIXELS 34
 #define ZONE_BLACK_MERGED_MIN_WIDTH 360.0f
 #define ZONE_BLACK_MERGED_MIN_HEIGHT 120.0f
-#define ZONE_BLACK_LINE_MIN_PIXELS 150
-#define ZONE_BLACK_LINE_MIN_SPAN 420
+#define ZONE_BLACK_LINE_MIN_PIXELS 95
+#define ZONE_BLACK_LINE_MIN_SPAN 330
 #define ZONE_SEARCH_Y_MIN 150
 #define ZONE_SEARCH_Y_MAX 690
 #define ZONE_RED_SEARCH_X_MIN 690
@@ -35,7 +35,7 @@
 #define ZONE_RED_MIN_HEIGHT 35.0f
 #define ZONE_RED_ROW_MIN_PIXELS 4
 #define ZONE_RED_ROW_BAND_MIN 3
-#define ZONE_LOCK_STABLE_FRAMES 3
+#define ZONE_LOCK_STABLE_FRAMES 1
 #define ZONE_LOCK_CENTER_TOL 90.0f
 #define ZONE_LOCK_SIZE_TOL 180.0f
 #define WIDTH 1280
@@ -204,195 +204,65 @@ static int zone_rect_contains_center(const ZoneRect *outer, const ZoneRect *inne
            cy >= outer->y1 && cy <= outer->y2;
 }
 
-static int zone_black_work_rect_candidate(const ZoneRect *rect) {
+static void zone_apply_workzone_perspective(ZoneRect *rect, int is_left_zone) {
     float w;
     float h;
-    float area;
+    float left_small;
+    float right_small;
+    float right_outer;
+    float top_y;
+    float bottom_y;
 
-    if (!zone_rect_valid_size(rect)) {
-        return 0;
+    if (rect == NULL || !rect->valid) {
+        return;
     }
 
     w = rect->x2 - rect->x1;
     h = rect->y2 - rect->y1;
-    area = w * h;
-
-    if (area < ZONE_BLACK_MIN_AREA || area > ZONE_BLACK_MAX_AREA) {
-        return 0;
-    }
-    if (rect->x1 <= ZONE_BLACK_BORDER_MARGIN ||
-        rect->y1 <= ZONE_BLACK_BORDER_MARGIN ||
-        rect->x2 >= WIDTH - ZONE_BLACK_BORDER_MARGIN ||
-        rect->y2 >= HEIGHT - ZONE_BLACK_BORDER_MARGIN) {
-        return 0;
-    }
-
-    return 1;
-}
-
-static int zone_rect_intersects(const ZoneRect *a, const ZoneRect *b) {
-    if (a == NULL || b == NULL || !a->valid || !b->valid) {
-        return 0;
-    }
-    return !(a->x2 < b->x1 || b->x2 < a->x1 ||
-             a->y2 < b->y1 || b->y2 < a->y1);
-}
-
-static void zone_rect_expand(ZoneRect *dst, const ZoneRect *src) {
-    if (dst == NULL || src == NULL || !src->valid) {
+    if (w <= 0.0f || h <= 0.0f) {
         return;
     }
-    if (!dst->valid) {
-        *dst = *src;
-        return;
+
+    left_small = w * 0.128f;
+    right_small = w * 0.024f;
+    right_outer = w * 0.140f;
+    top_y = rect->y1 + h * 0.12f;
+    bottom_y = rect->y2 - h * 0.04f;
+
+    if (is_left_zone) {
+        /* Left zone: bottom x is slightly smaller than top x on both side edges. */
+        rect->p0x = rect->x1 + left_small + w * 0.020f;
+        rect->p0y = top_y + h * 0.020f;
+        rect->p1x = rect->x2 - w * 0.020f;
+        rect->p1y = top_y + h * 0.040f;
+        rect->p2x = rect->x2 - right_small - w * 0.020f;
+        rect->p2y = bottom_y - h * 0.020f;
+        rect->p3x = rect->x1 - left_small * 0.45f + w * 0.020f;
+        rect->p3y = bottom_y - h * 0.020f;
+    } else {
+        /* Right zone: outer/right edge bottom protrudes right more than the top. */
+        rect->p0x = rect->x1 - right_small * 0.25f + w * 0.020f;
+        rect->p0y = top_y + h * 0.020f;
+        rect->p1x = rect->x2 - right_outer - w * 0.020f;
+        rect->p1y = top_y + h * 0.040f;
+        rect->p2x = rect->x2 + right_outer * 0.42f - w * 0.020f;
+        rect->p2y = bottom_y - h * 0.020f;
+        rect->p3x = rect->x1 + right_small + w * 0.020f;
+        rect->p3y = bottom_y - h * 0.020f;
     }
-    if (src->x1 < dst->x1) dst->x1 = src->x1;
-    if (src->y1 < dst->y1) dst->y1 = src->y1;
-    if (src->x2 > dst->x2) dst->x2 = src->x2;
-    if (src->y2 > dst->y2) dst->y2 = src->y2;
+
+    if (rect->p0x < rect->x1 - 40.0f) rect->p0x = rect->x1 - 40.0f;
+    if (rect->p3x < rect->x1 - 40.0f) rect->p3x = rect->x1 - 40.0f;
+    if (rect->p1x > rect->x2 + 40.0f) rect->p1x = rect->x2 + 40.0f;
+    if (rect->p2x > rect->x2 + 40.0f) rect->p2x = rect->x2 + 40.0f;
 }
 
-static int zone_color_rect_has_frame_edges(const ZoneRect *rect,
-                                           const uint8_t *mask,
-                                           int stride) {
-    int left_hits = 0;
-    int right_hits = 0;
-    int top_hits = 0;
-    int bottom_hits = 0;
-    int x1;
-    int y1;
-    int x2;
-    int y2;
-    int vertical_required;
-    int horizontal_required;
-    int passed_edges = 0;
-
-    if (!zone_rect_valid_size(rect) || mask == NULL || stride <= 0) {
-        return 0;
-    }
-
-    x1 = (int)rect->x1;
-    y1 = (int)rect->y1;
-    x2 = (int)rect->x2;
-    y2 = (int)rect->y2;
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 >= WIDTH) x2 = WIDTH - 1;
-    if (y2 >= HEIGHT) y2 = HEIGHT - 1;
-
-    for (int y = y1; y <= y2; y += ZONE_COLOR_STEP) {
-        int left_found = 0;
-        int right_found = 0;
-        for (int dx = 0; dx <= ZONE_EDGE_BAND_PX; dx += ZONE_COLOR_STEP) {
-            if (x1 + dx < WIDTH && mask[y * stride + x1 + dx]) {
-                left_found = 1;
-            }
-            if (x2 - dx >= 0 && mask[y * stride + x2 - dx]) {
-                right_found = 1;
-            }
-        }
-        left_hits += left_found;
-        right_hits += right_found;
-    }
-
-    for (int x = x1; x <= x2; x += ZONE_COLOR_STEP) {
-        int top_found = 0;
-        int bottom_found = 0;
-        for (int dy = 0; dy <= ZONE_EDGE_BAND_PX; dy += ZONE_COLOR_STEP) {
-            if (y1 + dy < HEIGHT && mask[(y1 + dy) * stride + x]) {
-                top_found = 1;
-            }
-            if (y2 - dy >= 0 && mask[(y2 - dy) * stride + x]) {
-                bottom_found = 1;
-            }
-        }
-        top_hits += top_found;
-        bottom_hits += bottom_found;
-    }
-
-    vertical_required = (int)(((y2 - y1) / ZONE_COLOR_STEP + 1) * ZONE_EDGE_MIN_RATIO);
-    horizontal_required = (int)(((x2 - x1) / ZONE_COLOR_STEP + 1) * ZONE_EDGE_MIN_RATIO);
-    if (vertical_required < 8) vertical_required = 8;
-    if (horizontal_required < 8) horizontal_required = 8;
-
-    if (left_hits >= vertical_required) passed_edges++;
-    if (right_hits >= vertical_required) passed_edges++;
-    if (top_hits >= horizontal_required) passed_edges++;
-    if (bottom_hits >= horizontal_required) passed_edges++;
-
-    return passed_edges >= 3 &&
-           (left_hits >= vertical_required || right_hits >= vertical_required) &&
-           (top_hits >= horizontal_required || bottom_hits >= horizontal_required);
-}
-
-static int zone_black_rect_has_frame_edges(const ZoneRect *rect,
-                                           const uint8_t *mask,
-                                           int stride) {
-    int left_hits = 0;
-    int right_hits = 0;
-    int top_hits = 0;
-    int bottom_hits = 0;
-    int x1;
-    int y1;
-    int x2;
-    int y2;
-    int vertical_required;
-    int horizontal_required;
-    int passed_edges = 0;
-
-    if (!zone_rect_valid_size(rect) || mask == NULL || stride <= 0) {
-        return 0;
-    }
-
-    x1 = (int)rect->x1;
-    y1 = (int)rect->y1;
-    x2 = (int)rect->x2;
-    y2 = (int)rect->y2;
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 >= WIDTH) x2 = WIDTH - 1;
-    if (y2 >= HEIGHT) y2 = HEIGHT - 1;
-
-    for (int y = y1; y <= y2; y += ZONE_COLOR_STEP) {
-        int left_found = 0;
-        int right_found = 0;
-        for (int dx = 0; dx <= ZONE_EDGE_BAND_PX; dx += ZONE_COLOR_STEP) {
-            if (x1 + dx < WIDTH && mask[y * stride + x1 + dx]) left_found = 1;
-            if (x2 - dx >= 0 && mask[y * stride + x2 - dx]) right_found = 1;
-        }
-        left_hits += left_found;
-        right_hits += right_found;
-    }
-
-    for (int x = x1; x <= x2; x += ZONE_COLOR_STEP) {
-        int top_found = 0;
-        int bottom_found = 0;
-        for (int dy = 0; dy <= ZONE_EDGE_BAND_PX; dy += ZONE_COLOR_STEP) {
-            if (y1 + dy < HEIGHT && mask[(y1 + dy) * stride + x]) top_found = 1;
-            if (y2 - dy >= 0 && mask[(y2 - dy) * stride + x]) bottom_found = 1;
-        }
-        top_hits += top_found;
-        bottom_hits += bottom_found;
-    }
-
-    vertical_required = (int)(((y2 - y1) / ZONE_COLOR_STEP + 1) * ZONE_BLACK_EDGE_MIN_RATIO);
-    horizontal_required = (int)(((x2 - x1) / ZONE_COLOR_STEP + 1) * ZONE_BLACK_EDGE_MIN_RATIO);
-    if (vertical_required < 6) vertical_required = 6;
-    if (horizontal_required < 6) horizontal_required = 6;
-
-    if (left_hits >= vertical_required) passed_edges++;
-    if (right_hits >= vertical_required) passed_edges++;
-    if (top_hits >= horizontal_required) passed_edges++;
-    if (bottom_hits >= horizontal_required) passed_edges++;
-
-    return passed_edges >= 2 &&
-           (left_hits >= vertical_required || right_hits >= vertical_required) &&
-           (top_hits >= horizontal_required || bottom_hits >= horizontal_required);
-}
-
-static int zone_find_best_color_component(const uint8_t *mask,
-                                          ZoneRect *best_rect,
-                                          int is_work_zone) {
+static int zone_find_loose_red_component_roi(const uint8_t *mask,
+                                             int x_min,
+                                             int x_max,
+                                             int y_min,
+                                             int y_max,
+                                             ZoneRect *best_rect) {
     uint8_t *visited = NULL;
     int *queue = NULL;
     int best_count = 0;
@@ -400,6 +270,12 @@ static int zone_find_best_color_component(const uint8_t *mask,
     if (mask == NULL || best_rect == NULL) {
         return 0;
     }
+
+    if (x_min < ZONE_BLACK_BORDER_MARGIN) x_min = ZONE_BLACK_BORDER_MARGIN;
+    if (x_max > WIDTH - ZONE_BLACK_BORDER_MARGIN) x_max = WIDTH - ZONE_BLACK_BORDER_MARGIN;
+    if (y_min < ZONE_SEARCH_Y_MIN) y_min = ZONE_SEARCH_Y_MIN;
+    if (y_max > ZONE_SEARCH_Y_MAX) y_max = ZONE_SEARCH_Y_MAX;
+    if (x_min >= x_max || y_min >= y_max) return 0;
 
     memset(best_rect, 0, sizeof(*best_rect));
     visited = (uint8_t *)calloc((size_t)WIDTH * HEIGHT, 1);
@@ -410,8 +286,8 @@ static int zone_find_best_color_component(const uint8_t *mask,
         return 0;
     }
 
-    for (int y = 0; y < HEIGHT; y += ZONE_COLOR_STEP) {
-        for (int x = 0; x < WIDTH; x += ZONE_COLOR_STEP) {
+    for (int y = y_min; y <= y_max; y += ZONE_COLOR_STEP) {
+        for (int x = x_min; x <= x_max; x += ZONE_COLOR_STEP) {
             int start = y * WIDTH + x;
             int head = 0;
             int tail = 0;
@@ -430,18 +306,8 @@ static int zone_find_best_color_component(const uint8_t *mask,
                 int idx = queue[head++];
                 int cx = idx % WIDTH;
                 int cy = idx / WIDTH;
-                const int nx[4] = {
-                    cx - ZONE_COLOR_STEP,
-                    cx + ZONE_COLOR_STEP,
-                    cx,
-                    cx
-                };
-                const int ny[4] = {
-                    cy,
-                    cy,
-                    cy - ZONE_COLOR_STEP,
-                    cy + ZONE_COLOR_STEP
-                };
+                const int nx[4] = { cx - ZONE_COLOR_STEP, cx + ZONE_COLOR_STEP, cx, cx };
+                const int ny[4] = { cy, cy, cy - ZONE_COLOR_STEP, cy + ZONE_COLOR_STEP };
 
                 zone_update_candidate(&rect, &count, cx, cy);
 
@@ -449,7 +315,7 @@ static int zone_find_best_color_component(const uint8_t *mask,
                     int px = nx[i];
                     int py = ny[i];
                     int next;
-                    if (px < 0 || px >= WIDTH || py < 0 || py >= HEIGHT) {
+                    if (px < x_min || px > x_max || py < y_min || py > y_max) {
                         continue;
                     }
                     next = py * WIDTH + px;
@@ -461,19 +327,15 @@ static int zone_find_best_color_component(const uint8_t *mask,
                 }
             }
 
-            rect.valid = count >= ZONE_COLOR_MIN_PIXELS;
+            rect.valid = count >= 14;
             rect.x2 += ZONE_COLOR_STEP;
             rect.y2 += ZONE_COLOR_STEP;
-            if (!zone_rect_valid_size(&rect)) {
-                rect.valid = 0;
-            }
             if (rect.valid &&
-                (is_work_zone
-                     ? !zone_black_rect_has_frame_edges(&rect, mask, WIDTH)
-                     : !zone_color_rect_has_frame_edges(&rect, mask, WIDTH))) {
-                rect.valid = 0;
-            }
-            if (rect.valid && count > best_count) {
+                (rect.x2 - rect.x1) >= 70.0f &&
+                (rect.y2 - rect.y1) >= 24.0f &&
+                (rect.x2 - rect.x1) <= 470.0f &&
+                (rect.y2 - rect.y1) <= 240.0f &&
+                count > best_count) {
                 best_count = count;
                 *best_rect = rect;
             }
@@ -482,526 +344,66 @@ static int zone_find_best_color_component(const uint8_t *mask,
 
     free(visited);
     free(queue);
-    return best_count >= ZONE_COLOR_MIN_PIXELS;
+
+    if (best_count > 0) {
+        best_rect->p0x = best_rect->x1;
+        best_rect->p0y = best_rect->y1;
+        best_rect->p1x = best_rect->x2;
+        best_rect->p1y = best_rect->y1;
+        best_rect->p2x = best_rect->x2;
+        best_rect->p2y = best_rect->y2;
+        best_rect->p3x = best_rect->x1;
+        best_rect->p3y = best_rect->y2;
+        best_rect->valid = 1;
+        return 1;
+    }
+    return 0;
 }
 
-static int zone_find_red_region_rect(const uint8_t *mask, ZoneRect *red_rect) {
-    int count = 0;
-    int left_by_y[HEIGHT];
-    int right_by_y[HEIGHT];
-    int count_by_y[HEIGHT];
-    int valid_rows[HEIGHT];
-    int valid_row_count = 0;
-    int top_band_count = 0;
-    int bottom_band_count = 0;
-    int top_left_sum = 0;
-    int top_right_sum = 0;
-    int top_y_sum = 0;
-    int bottom_left_sum = 0;
-    int bottom_right_sum = 0;
-    int bottom_y_sum = 0;
-    int band_rows;
+static int zone_find_two_red_work_regions(const uint8_t *mask,
+                                          ZoneRect *zone1,
+                                          ZoneRect *zone2) {
+    int left_ok;
+    int right_ok;
 
-    if (mask == NULL || red_rect == NULL) {
+    if (mask == NULL || zone1 == NULL || zone2 == NULL) {
         return 0;
-    }
-
-    memset(red_rect, 0, sizeof(*red_rect));
-    for (int y = 0; y < HEIGHT; y++) {
-        left_by_y[y] = WIDTH;
-        right_by_y[y] = -1;
-        count_by_y[y] = 0;
-    }
-
-    for (int y = ZONE_RED_SEARCH_Y_MIN; y <= ZONE_RED_SEARCH_Y_MAX; y += ZONE_COLOR_STEP) {
-        for (int x = ZONE_RED_SEARCH_X_MIN; x <= ZONE_RED_SEARCH_X_MAX; x += ZONE_COLOR_STEP) {
-            if (!mask[y * WIDTH + x]) {
-                continue;
-            }
-            zone_update_candidate(red_rect, &count, x, y);
-            if (x < left_by_y[y]) left_by_y[y] = x;
-            if (x > right_by_y[y]) right_by_y[y] = x;
-            count_by_y[y]++;
-        }
-    }
-
-    red_rect->valid = count >= ZONE_RED_MIN_PIXELS;
-    red_rect->x2 += ZONE_COLOR_STEP;
-    red_rect->y2 += ZONE_COLOR_STEP;
-    if (!red_rect->valid ||
-        (red_rect->x2 - red_rect->x1) < ZONE_RED_MIN_WIDTH ||
-        (red_rect->y2 - red_rect->y1) < ZONE_RED_MIN_HEIGHT) {
-        memset(red_rect, 0, sizeof(*red_rect));
-        return 0;
-    }
-
-    for (int y = (int)red_rect->y1; y <= (int)red_rect->y2 && y < HEIGHT; y += ZONE_COLOR_STEP) {
-        if (count_by_y[y] >= ZONE_RED_ROW_MIN_PIXELS &&
-            right_by_y[y] > left_by_y[y] &&
-            (right_by_y[y] - left_by_y[y]) >= 18) {
-            valid_rows[valid_row_count++] = y;
-        }
-    }
-
-    band_rows = valid_row_count / 4;
-    if (band_rows < ZONE_RED_ROW_BAND_MIN) band_rows = ZONE_RED_ROW_BAND_MIN;
-    if (band_rows > valid_row_count / 2) band_rows = valid_row_count / 2;
-
-    if (valid_row_count < ZONE_RED_ROW_BAND_MIN * 2 || band_rows <= 0) {
-        red_rect->p0x = red_rect->x1;
-        red_rect->p0y = red_rect->y1;
-        red_rect->p1x = red_rect->x2;
-        red_rect->p1y = red_rect->y1;
-        red_rect->p2x = red_rect->x2;
-        red_rect->p2y = red_rect->y2;
-        red_rect->p3x = red_rect->x1;
-        red_rect->p3y = red_rect->y2;
-    } else {
-        for (int i = 0; i < band_rows; i++) {
-            int y = valid_rows[i];
-            top_left_sum += left_by_y[y];
-            top_right_sum += right_by_y[y];
-            top_y_sum += y;
-            top_band_count++;
-        }
-        for (int i = valid_row_count - band_rows; i < valid_row_count; i++) {
-            int y = valid_rows[i];
-            bottom_left_sum += left_by_y[y];
-            bottom_right_sum += right_by_y[y];
-            bottom_y_sum += y;
-            bottom_band_count++;
-        }
-
-        if (top_band_count > 0 && bottom_band_count > 0) {
-            float top_left = (float)top_left_sum / top_band_count;
-            float top_right = (float)top_right_sum / top_band_count;
-            float bottom_left = (float)bottom_left_sum / bottom_band_count;
-            float bottom_right = (float)bottom_right_sum / bottom_band_count;
-            float top_y_avg = (float)top_y_sum / top_band_count;
-            float bottom_y_avg = (float)bottom_y_sum / bottom_band_count;
-            float left_edge = red_rect->x1 + 8.0f;
-            float right_edge = red_rect->x2 - 8.0f;
-            float top_edge = red_rect->y1 + 8.0f;
-            float bottom_edge = red_rect->y2 - 8.0f;
-
-            if (top_left > left_edge + 60.0f) top_left = left_edge;
-            if (bottom_left > left_edge + 55.0f) bottom_left = left_edge + 10.0f;
-            if (top_right < right_edge - 80.0f) top_right = right_edge - 85.0f;
-            if (bottom_right < right_edge - 45.0f) bottom_right = right_edge;
-            if (bottom_left > top_left + 70.0f) bottom_left = top_left + 45.0f;
-            if (bottom_right < top_right + 20.0f) bottom_right = top_right + 55.0f;
-            if (top_y_avg > top_edge + 55.0f) top_y_avg = top_edge;
-            if (bottom_y_avg < bottom_edge - 55.0f) bottom_y_avg = bottom_edge;
-
-            red_rect->p0x = top_left;
-            red_rect->p0y = top_y_avg;
-            red_rect->p1x = top_right;
-            red_rect->p1y = top_y_avg + 4.0f;
-            red_rect->p2x = bottom_right;
-            red_rect->p2y = bottom_y_avg;
-            red_rect->p3x = bottom_left;
-            red_rect->p3y = bottom_y_avg - 4.0f;
-        }
-    }
-
-    if (red_rect->p0x < red_rect->x1) red_rect->p0x = red_rect->x1;
-    if (red_rect->p3x < red_rect->x1) red_rect->p3x = red_rect->x1;
-    if (red_rect->p1x > red_rect->x2) red_rect->p1x = red_rect->x2;
-    if (red_rect->p2x > red_rect->x2) red_rect->p2x = red_rect->x2;
-
-    return 1;
-}
-
-static int zone_measure_black_row_band(const uint8_t *mask,
-                                       int center_y,
-                                       int x_min,
-                                       int x_max,
-                                       int *out_x1,
-                                       int *out_x2) {
-    int best_count = 0;
-    int best_x1 = WIDTH;
-    int best_x2 = -1;
-
-    if (mask == NULL) {
-        return 0;
-    }
-    if (center_y < ZONE_SEARCH_Y_MIN) center_y = ZONE_SEARCH_Y_MIN;
-    if (center_y > ZONE_SEARCH_Y_MAX) center_y = ZONE_SEARCH_Y_MAX;
-    if (x_min < ZONE_BLACK_BORDER_MARGIN) x_min = ZONE_BLACK_BORDER_MARGIN;
-    if (x_max > WIDTH - ZONE_BLACK_BORDER_MARGIN) x_max = WIDTH - ZONE_BLACK_BORDER_MARGIN;
-
-    for (int y = center_y - 6; y <= center_y + 6; y += ZONE_COLOR_STEP) {
-        int run_count = 0;
-        int run_x1 = -1;
-        int gap = 0;
-        if (y < ZONE_SEARCH_Y_MIN || y > ZONE_SEARCH_Y_MAX) {
-            continue;
-        }
-        for (int x = x_min; x <= x_max; x += ZONE_COLOR_STEP) {
-            if (mask[y * WIDTH + x]) {
-                if (run_count == 0) {
-                    run_x1 = x;
-                }
-                run_count++;
-                gap = 0;
-            } else if (run_count > 0 && gap < 5) {
-                gap++;
-            } else {
-                int run_x2 = x - (gap + 1) * ZONE_COLOR_STEP;
-                if (run_count > best_count && run_x2 > run_x1) {
-                    best_count = run_count;
-                    best_x1 = run_x1;
-                    best_x2 = run_x2;
-                }
-                run_count = 0;
-                run_x1 = -1;
-                gap = 0;
-            }
-        }
-        if (run_count > 0) {
-            int run_x2 = x_max - gap * ZONE_COLOR_STEP;
-            if (run_count > best_count && run_x2 > run_x1) {
-                best_count = run_count;
-                best_x1 = run_x1;
-                best_x2 = run_x2;
-            }
-        }
-    }
-
-    if (out_x1 != NULL) *out_x1 = best_x1;
-    if (out_x2 != NULL) *out_x2 = best_x2;
-    return best_count;
-}
-
-static int zone_find_best_black_horizontal_line(const uint8_t *mask,
-                                                int y_min,
-                                                int y_max,
-                                                int x_min,
-                                                int x_max,
-                                                int *best_y,
-                                                int *best_x1,
-                                                int *best_x2) {
-    int best_score = 0;
-    int found = 0;
-
-    if (mask == NULL || best_y == NULL || best_x1 == NULL || best_x2 == NULL) {
-        return 0;
-    }
-    if (y_min < ZONE_SEARCH_Y_MIN) y_min = ZONE_SEARCH_Y_MIN;
-    if (y_max > ZONE_SEARCH_Y_MAX) y_max = ZONE_SEARCH_Y_MAX;
-    if (y_min > y_max) {
-        return 0;
-    }
-
-    for (int y = y_min; y <= y_max; y += ZONE_COLOR_STEP) {
-        int x1 = WIDTH;
-        int x2 = -1;
-        int count = zone_measure_black_row_band(mask, y, x_min, x_max, &x1, &x2);
-        int span = x2 - x1;
-        int score;
-
-        if (count < ZONE_BLACK_LINE_MIN_PIXELS || span < ZONE_BLACK_LINE_MIN_SPAN) {
-            continue;
-        }
-        score = count * 3 + span / 4;
-        if (!found || score > best_score) {
-            found = 1;
-            best_score = score;
-            *best_y = y;
-            *best_x1 = x1;
-            *best_x2 = x2;
-        }
-    }
-
-    return found;
-}
-
-static int zone_find_lowest_black_horizontal_line(const uint8_t *mask,
-                                               int y_min,
-                                               int y_max,
-                                               int x_min,
-                                               int x_max,
-                                               int *best_y,
-                                               int *best_x1,
-                                               int *best_x2) {
-    int found = 0;
-
-    if (mask == NULL || best_y == NULL || best_x1 == NULL || best_x2 == NULL) {
-        return 0;
-    }
-    if (y_min < ZONE_SEARCH_Y_MIN) y_min = ZONE_SEARCH_Y_MIN;
-    if (y_max > ZONE_SEARCH_Y_MAX) y_max = ZONE_SEARCH_Y_MAX;
-    if (y_min > y_max) {
-        return 0;
-    }
-
-    for (int y = y_min; y <= y_max; y += ZONE_COLOR_STEP) {
-        int x1 = WIDTH;
-        int x2 = -1;
-        int count = zone_measure_black_row_band(mask, y, x_min, x_max, &x1, &x2);
-        int span = x2 - x1;
-
-        if (count < ZONE_BLACK_LINE_MIN_PIXELS || span < ZONE_BLACK_LINE_MIN_SPAN) {
-            continue;
-        }
-
-        if (!found || y > *best_y) {
-            found = 1;
-            *best_y = y;
-            *best_x1 = x1;
-            *best_x2 = x2;
-        }
-    }
-
-    return found;
-}
-
-static float zone_clamp_float(float value, float min_value, float max_value) {
-    if (value < min_value) return min_value;
-    if (value > max_value) return max_value;
-    return value;
-}
-
-static int zone_find_black_work_rect_by_lines(const uint8_t *mask,
-                                              const ZoneRect *red_rect,
-                                              ZoneRect *work_rect) {
-    int bottom_y = 0;
-    int bottom_x1 = 0;
-    int bottom_x2 = 0;
-    int bottom_found;
-    int search_x1;
-    int search_x2;
-    float outer_left;
-    float outer_right;
-    float top_y;
-    float bottom_left_y;
-    float bottom_right_y;
-    float top_slope = 0.0f;
-    float bottom_slope = 0.0f;
-    float red_top_dx;
-    float red_bottom_dx;
-    float top_x1;
-    float top_x2;
-    float bottom_left;
-    float bottom_right;
-    float red_right_dx;
-    float red_right_dy;
-    float right_dx_per_y = 0.0f;
-
-    if (mask == NULL || red_rect == NULL || !red_rect->valid || work_rect == NULL) {
-        return 0;
-    }
-
-    memset(work_rect, 0, sizeof(*work_rect));
-    search_x1 = ZONE_BLACK_BORDER_MARGIN;
-    search_x2 = WIDTH - ZONE_BLACK_BORDER_MARGIN;
-
-    bottom_found = zone_find_lowest_black_horizontal_line(mask,
-                                                          (int)(red_rect->y2 + 18.0f),
-                                                          (int)(red_rect->y2 + 115.0f),
-                                                          search_x1,
-                                                          search_x2,
-                                                          &bottom_y,
-                                                          &bottom_x1,
-                                                          &bottom_x2);
-    if (!bottom_found) {
-        return 0;
-    }
-
-    red_top_dx = red_rect->p1x - red_rect->p0x;
-    red_bottom_dx = red_rect->p2x - red_rect->p3x;
-    if (red_top_dx > 20.0f || red_top_dx < -20.0f) {
-        top_slope = (red_rect->p1y - red_rect->p0y) / red_top_dx;
-    }
-    if (red_bottom_dx > 20.0f || red_bottom_dx < -20.0f) {
-        bottom_slope = (red_rect->p2y - red_rect->p3y) / red_bottom_dx;
-    } else {
-        bottom_slope = top_slope;
-    }
-    red_right_dx = red_rect->p2x - red_rect->p1x;
-    red_right_dy = red_rect->p2y - red_rect->p1y;
-    if (red_right_dy > 10.0f || red_right_dy < -10.0f) {
-        right_dx_per_y = red_right_dx / red_right_dy;
     }
 
     /*
-     * The black work zone is the outer frame.  The front/back edges are
-     * generated parallel to the red danger zone edges, while the bottom edge
-     * is anchored by the lowest long black line in the lower ROI.
+     * Restore the old stable red-zone strategy: red mask -> connected component
+     * -> three-edge frame validation.  Run it independently in the lower-left
+     * and lower-right floor ROIs for the two work zones.
      */
-    outer_left = red_rect->x1 - 830.0f;
-    outer_right = red_rect->x2 + 105.0f;
-    outer_left = zone_clamp_float(outer_left, (float)ZONE_BLACK_BORDER_MARGIN, (float)(WIDTH - 260));
-    outer_right = zone_clamp_float(outer_right, red_rect->x2 + 35.0f, (float)(WIDTH - ZONE_BLACK_BORDER_MARGIN));
+    left_ok = zone_find_loose_red_component_roi(mask,
+                                                100,
+                                                570,
+                                                300,
+                                                560,
+                                                zone1);
+    right_ok = zone_find_loose_red_component_roi(mask,
+                                                 500,
+                                                 1260,
+                                                 270,
+                                                 660,
+                                                 zone2);
 
-    bottom_left = (float)bottom_x1;
-    bottom_right = (float)bottom_x2;
-    if (bottom_left > outer_left + 60.0f) bottom_left = outer_left;
-    if (bottom_right < outer_right) bottom_right = outer_right;
-    if (bottom_right > WIDTH - ZONE_BLACK_BORDER_MARGIN) {
-        bottom_right = WIDTH - ZONE_BLACK_BORDER_MARGIN;
+    if (left_ok) {
+        zone_apply_workzone_perspective(zone1, 1);
+    }
+    if (right_ok) {
+        zone_apply_workzone_perspective(zone2, 0);
     }
 
-    bottom_left_y = (float)bottom_y - 7.0f;
-    bottom_right_y = bottom_left_y + bottom_slope * (bottom_right - bottom_left);
-    bottom_left_y = zone_clamp_float(bottom_left_y, (float)ZONE_SEARCH_Y_MIN, (float)ZONE_SEARCH_Y_MAX);
-    bottom_right_y = zone_clamp_float(bottom_right_y, (float)ZONE_SEARCH_Y_MIN, (float)ZONE_SEARCH_Y_MAX);
-
-    top_y = red_rect->y1 - 48.0f;
-    if (top_y < ZONE_SEARCH_Y_MIN) top_y = (float)ZONE_SEARCH_Y_MIN;
-    if (top_y > bottom_left_y - 110.0f) top_y = bottom_left_y - 135.0f;
-    if (top_y < ZONE_SEARCH_Y_MIN) top_y = (float)ZONE_SEARCH_Y_MIN;
-
-    top_x1 = outer_left + 245.0f;
-    /*
-     * Make the black right side parallel to the red danger-zone right side:
-     * p1(top-right) is derived from p2(bottom-right) using the red side
-     * dx/dy, instead of being independently clamped toward the wall corner.
-     */
-    top_x2 = bottom_right - right_dx_per_y * (bottom_right_y - top_y);
-    if (top_x2 < red_rect->x2 - 95.0f) top_x2 = red_rect->x2 - 95.0f;
-    if (top_x2 > red_rect->x2 + 18.0f) top_x2 = red_rect->x2 + 18.0f;
-    if (top_x2 <= top_x1 + 300.0f) top_x1 = top_x2 - 330.0f;
-    if (top_x1 < ZONE_BLACK_BORDER_MARGIN) top_x1 = ZONE_BLACK_BORDER_MARGIN;
-
-    work_rect->valid = 1;
-    work_rect->p0x = top_x1;
-    work_rect->p0y = top_y;
-    if (top_x2 > red_rect->x2 - 20.0f) top_x2 = red_rect->x2 - 20.0f;
-    work_rect->p1x = top_x2;
-    work_rect->p1y = top_y + top_slope * (top_x2 - top_x1);
-    work_rect->p2x = bottom_right;
-    work_rect->p2y = bottom_right_y;
-    work_rect->p3x = bottom_left;
-    work_rect->p3y = bottom_left_y;
-
-    work_rect->x1 = work_rect->p3x < work_rect->p0x ? work_rect->p3x : work_rect->p0x;
-    work_rect->x2 = work_rect->p2x > work_rect->p1x ? work_rect->p2x : work_rect->p1x;
-    work_rect->y1 = work_rect->p0y < work_rect->p1y ? work_rect->p0y : work_rect->p1y;
-    work_rect->y2 = work_rect->p3y > work_rect->p2y ? work_rect->p3y : work_rect->p2y;
-
-    if ((work_rect->x2 - work_rect->x1) < ZONE_BLACK_MERGED_MIN_WIDTH ||
-        (work_rect->y2 - work_rect->y1) < ZONE_BLACK_MERGED_MIN_HEIGHT ||
-        !zone_rect_contains_center(work_rect, red_rect) ||
-        work_rect->x2 < red_rect->x2 + 35.0f ||
-        work_rect->x1 > red_rect->x1 - 80.0f) {
-        memset(work_rect, 0, sizeof(*work_rect));
+    if (!left_ok || !right_ok) {
+        printf("[ZoneDetect] red work zones not detected: left=%d right=%d\n",
+               left_ok, right_ok);
         return 0;
     }
 
-    printf("[ZoneDetect] black parallel work top=[%.0f,%.0f %.0f,%.0f] bottom=[%.0f,%.0f %.0f,%.0f] red=[%.0f,%.0f,%.0f,%.0f]\n",
-           work_rect->p0x, work_rect->p0y,
-           work_rect->p1x, work_rect->p1y,
-           work_rect->p3x, work_rect->p3y,
-           work_rect->p2x, work_rect->p2y,
-           red_rect->x1, red_rect->y1, red_rect->x2, red_rect->y2);
-    return 1;
-}
-
-static int zone_find_merged_black_work_rect(const uint8_t *mask,
-                                            const ZoneRect *red_rect,
-                                            ZoneRect *work_rect) {
-    uint8_t *visited = NULL;
-    int *queue = NULL;
-    ZoneRect search_roi;
-    int merged_pixels = 0;
-
-    if (mask == NULL || red_rect == NULL || !red_rect->valid || work_rect == NULL) {
-        return 0;
-    }
-
-    memset(work_rect, 0, sizeof(*work_rect));
-    memset(&search_roi, 0, sizeof(search_roi));
-    search_roi.valid = 1;
-    search_roi.x1 = red_rect->x1 - 520.0f;
-    search_roi.y1 = red_rect->y1 - 170.0f;
-    search_roi.x2 = red_rect->x2 + 120.0f;
-    search_roi.y2 = red_rect->y2 + 120.0f;
-    if (search_roi.x1 < ZONE_BLACK_BORDER_MARGIN) search_roi.x1 = ZONE_BLACK_BORDER_MARGIN;
-    if (search_roi.y1 < ZONE_SEARCH_Y_MIN) search_roi.y1 = ZONE_SEARCH_Y_MIN;
-    if (search_roi.x2 > WIDTH - ZONE_BLACK_BORDER_MARGIN) search_roi.x2 = WIDTH - ZONE_BLACK_BORDER_MARGIN;
-    if (search_roi.y2 > ZONE_SEARCH_Y_MAX) search_roi.y2 = ZONE_SEARCH_Y_MAX;
-
-    visited = (uint8_t *)calloc((size_t)WIDTH * HEIGHT, 1);
-    queue = (int *)malloc((size_t)WIDTH * HEIGHT * sizeof(int));
-    if (visited == NULL || queue == NULL) {
-        free(visited);
-        free(queue);
-        return 0;
-    }
-
-    for (int y = (int)search_roi.y1; y <= (int)search_roi.y2; y += ZONE_COLOR_STEP) {
-        for (int x = (int)search_roi.x1; x <= (int)search_roi.x2; x += ZONE_COLOR_STEP) {
-            int start = y * WIDTH + x;
-            int head = 0;
-            int tail = 0;
-            int count = 0;
-            ZoneRect rect;
-
-            if (!mask[start] || visited[start]) {
-                continue;
-            }
-
-            memset(&rect, 0, sizeof(rect));
-            visited[start] = 1;
-            queue[tail++] = start;
-
-            while (head < tail) {
-                int idx = queue[head++];
-                int cx = idx % WIDTH;
-                int cy = idx / WIDTH;
-                const int nx[4] = {cx - ZONE_COLOR_STEP, cx + ZONE_COLOR_STEP, cx, cx};
-                const int ny[4] = {cy, cy, cy - ZONE_COLOR_STEP, cy + ZONE_COLOR_STEP};
-
-                zone_update_candidate(&rect, &count, cx, cy);
-
-                for (int i = 0; i < 4; i++) {
-                    int px = nx[i];
-                    int py = ny[i];
-                    int next;
-                    if (px < (int)search_roi.x1 || px > (int)search_roi.x2 ||
-                        py < (int)search_roi.y1 || py > (int)search_roi.y2) {
-                        continue;
-                    }
-                    next = py * WIDTH + px;
-                    if (!mask[next] || visited[next]) {
-                        continue;
-                    }
-                    visited[next] = 1;
-                    queue[tail++] = next;
-                }
-            }
-
-            rect.valid = count >= ZONE_BLACK_SEGMENT_MIN_PIXELS;
-            rect.x2 += ZONE_COLOR_STEP;
-            rect.y2 += ZONE_COLOR_STEP;
-            if (!rect.valid || !zone_rect_intersects(&rect, &search_roi)) {
-                continue;
-            }
-
-            zone_rect_expand(work_rect, &rect);
-            merged_pixels += count;
-        }
-    }
-
-    free(visited);
-    free(queue);
-
-    if (!work_rect->valid || merged_pixels < ZONE_COLOR_MIN_PIXELS) {
-        return 0;
-    }
-    if ((work_rect->x2 - work_rect->x1) < ZONE_BLACK_MERGED_MIN_WIDTH ||
-        (work_rect->y2 - work_rect->y1) < ZONE_BLACK_MERGED_MIN_HEIGHT ||
-        (work_rect->x2 - work_rect->x1) > 760.0f ||
-        (work_rect->y2 - work_rect->y1) > 360.0f) {
-        work_rect->valid = 0;
-        return 0;
-    }
-    if (!zone_rect_contains_center(work_rect, red_rect)) {
-        work_rect->valid = 0;
-        return 0;
-    }
-
+    printf("[ZoneDetect] red work zones old-component zone1=[%.0f,%.0f,%.0f,%.0f] zone2=[%.0f,%.0f,%.0f,%.0f]\n",
+           zone1->x1, zone1->y1, zone1->x2, zone1->y2,
+           zone2->x1, zone2->y1, zone2->x2, zone2->y2);
     return 1;
 }
 
@@ -1010,7 +412,6 @@ static int zone_detect_color_rects_nv12(const uint8_t *nv12,
                                         ZoneRect *red_rect) {
     const uint8_t *y_plane;
     const uint8_t *uv_plane;
-    uint8_t *work_mask = NULL;
     uint8_t *red_mask = NULL;
     int ok = 0;
 
@@ -1020,18 +421,15 @@ static int zone_detect_color_rects_nv12(const uint8_t *nv12,
 
     memset(work_rect, 0, sizeof(*work_rect));
     memset(red_rect, 0, sizeof(*red_rect));
-    work_mask = (uint8_t *)calloc((size_t)WIDTH * HEIGHT, 1);
     red_mask = (uint8_t *)calloc((size_t)WIDTH * HEIGHT, 1);
-    if (work_mask == NULL || red_mask == NULL) {
-        free(work_mask);
-        free(red_mask);
+    if (red_mask == NULL) {
         return 0;
     }
 
     y_plane = nv12;
     uv_plane = nv12 + WIDTH * HEIGHT;
 
-    for (int y = ZONE_SEARCH_Y_MIN; y <= ZONE_SEARCH_Y_MAX; y += ZONE_COLOR_STEP) {
+    for (int y = ZONE_RED_SEARCH_Y_MIN; y <= ZONE_RED_SEARCH_Y_MAX; y += ZONE_COLOR_STEP) {
         const uint8_t *y_row = y_plane + y * WIDTH;
         const uint8_t *uv_row = uv_plane + (y / 2) * WIDTH;
         for (int x = ZONE_BLACK_BORDER_MARGIN; x < WIDTH - ZONE_BLACK_BORDER_MARGIN; x += ZONE_COLOR_STEP) {
@@ -1047,34 +445,14 @@ static int zone_detect_color_rects_nv12(const uint8_t *nv12,
             if (g < 0) g = 0; else if (g > 255) g = 255;
             if (b < 0) b = 0; else if (b > 255) b = 255;
 
-            if (yy < ZONE_BLACK_MAX_Y &&
-                abs(u) <= ZONE_BLACK_MAX_CHROMA_DELTA &&
-                abs(v) <= ZONE_BLACK_MAX_CHROMA_DELTA) {
-                work_mask[y * WIDTH + x] = 1;
-            } else if (x >= ZONE_RED_SEARCH_X_MIN &&
-                       x <= ZONE_RED_SEARCH_X_MAX &&
-                       y >= ZONE_RED_SEARCH_Y_MIN &&
-                       y <= ZONE_RED_SEARCH_Y_MAX &&
-                       r > 85 && r > g + 18 && r > b + 12) {
+            if (r > 88 && r > g + 24 && r > b + 14 && v > 6) {
                 red_mask[y * WIDTH + x] = 1;
             }
         }
     }
 
-    red_rect->valid = zone_find_red_region_rect(red_mask, red_rect);
-    if (red_rect->valid) {
-        work_rect->valid = zone_find_black_work_rect_by_lines(work_mask, red_rect, work_rect);
-    } else {
-        work_rect->valid = zone_find_best_color_component(work_mask, work_rect, 1);
-        if (work_rect->valid && !zone_black_work_rect_candidate(work_rect)) {
-            work_rect->valid = 0;
-        }
-    }
-    ok = work_rect->valid && red_rect->valid &&
-         zone_rect_contains_center(work_rect, red_rect);
-    free(work_mask);
+    ok = zone_find_two_red_work_regions(red_mask, work_rect, red_rect);
     free(red_mask);
-
     return ok;
 }
 
@@ -1151,7 +529,7 @@ void zone_runtime_scan_frame(const CameraCtx *cam,
     mqtt_update_zone_detection_result(ok);
 
     if (ok) {
-        printf("[ZoneDetect] locked black work=[%.0f,%.0f,%.0f,%.0f] red danger=[%.0f,%.0f,%.0f,%.0f] quad=[%.0f,%.0f %.0f,%.0f %.0f,%.0f %.0f,%.0f]\n",
+        printf("[ZoneDetect] locked work1=[%.0f,%.0f,%.0f,%.0f] work2=[%.0f,%.0f,%.0f,%.0f] quad2=[%.0f,%.0f %.0f,%.0f %.0f,%.0f %.0f,%.0f]\n",
                locked_work_zone.x1, locked_work_zone.y1, locked_work_zone.x2, locked_work_zone.y2,
                locked_danger_zone.x1, locked_danger_zone.y1, locked_danger_zone.x2, locked_danger_zone.y2,
                locked_danger_zone.p0x, locked_danger_zone.p0y,
@@ -1161,7 +539,7 @@ void zone_runtime_scan_frame(const CameraCtx *cam,
     } else {
         static int fail_log_count = 0;
         if ((fail_log_count++ % 10) == 0) {
-            printf("[ZoneDetect] not detected: black_valid=%d red_valid=%d\n",
+            printf("[ZoneDetect] not detected: work1_valid=%d work2_valid=%d\n",
                    work_rect.valid,
                    red_rect.valid);
         }

@@ -4,10 +4,14 @@
 
 #include <curl/curl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
@@ -24,6 +28,8 @@ typedef struct {
     char device_id[64];
     long connect_timeout_sec;
     long request_timeout_sec;
+    long low_speed_limit_bps;
+    long low_speed_time_sec;
 } VideoUploaderHttpConfig;
 
 static void video_uploader_buffer_reset(VideoUploaderHttpBuffer *buffer) {
@@ -245,6 +251,8 @@ static int video_uploader_http_fill_from_macro(VideoUploaderHttpConfig *cfg) {
 
     cfg->connect_timeout_sec = VIDEO_UPLOADER_HTTP_CONNECT_TIMEOUT_SEC;
     cfg->request_timeout_sec = VIDEO_UPLOADER_HTTP_REQUEST_TIMEOUT_SEC;
+    cfg->low_speed_limit_bps = VIDEO_UPLOADER_HTTP_LOW_SPEED_LIMIT_BPS;
+    cfg->low_speed_time_sec = VIDEO_UPLOADER_HTTP_LOW_SPEED_TIME_SEC;
     return 0;
 }
 
@@ -306,6 +314,137 @@ static int video_uploader_wait(VideoUploader *uploader, int timeout_ms) {
             return -1;
         }
         return 1;
+    }
+
+    return 0;
+}
+
+static int video_uploader_parse_ipv4_endpoint(const char *url,
+                                              char *ip,
+                                              size_t ip_size,
+                                              int *port_out) {
+    const char *host;
+    const char *host_end;
+    const char *port_start = NULL;
+    size_t host_len;
+    int port = 80;
+
+    if (url == NULL || ip == NULL || ip_size == 0 || port_out == NULL) {
+        return EINVAL;
+    }
+
+    host = strstr(url, "://");
+    host = host != NULL ? host + 3 : url;
+    host_end = host;
+    while (*host_end != '\0' && *host_end != '/' && *host_end != ':') {
+        host_end++;
+    }
+    if (*host_end == ':') {
+        port_start = host_end + 1;
+    }
+
+    host_len = (size_t)(host_end - host);
+    if (host_len == 0 || host_len >= ip_size) {
+        return EINVAL;
+    }
+
+    memcpy(ip, host, host_len);
+    ip[host_len] = '\0';
+
+    if (port_start != NULL) {
+        char *endptr = NULL;
+        long parsed = strtol(port_start, &endptr, 10);
+        if (parsed > 0 && parsed <= 65535) {
+            port = (int)parsed;
+        }
+    }
+
+    *port_out = port;
+    return 0;
+}
+
+static int video_uploader_tcp_reachable(const char *url, int timeout_ms) {
+    char ip[64];
+    int port = 80;
+    int fd;
+    int flags;
+    int rc;
+    int err = 0;
+    socklen_t err_len = sizeof(err);
+    struct sockaddr_in addr;
+    struct pollfd pfd;
+
+    if (video_uploader_parse_ipv4_endpoint(url, ip, sizeof(ip), &port) != 0) {
+        return 0;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return 0;
+    }
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+        close(fd);
+        return 0;
+    }
+
+    rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc == 0) {
+        close(fd);
+        return 1;
+    }
+    if (errno != EINPROGRESS) {
+        close(fd);
+        return 0;
+    }
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0 || (pfd.revents & POLLOUT) == 0) {
+        close(fd);
+        return 0;
+    }
+
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) != 0 || err != 0) {
+        close(fd);
+        return 0;
+    }
+
+    close(fd);
+    return 1;
+}
+
+static int video_uploader_wait_retry_or_network(VideoUploader *uploader, int timeout_ms) {
+    int waited_ms = 0;
+    const int step_ms = 1000;
+
+    while (!uploader->stopping && waited_ms < timeout_ms) {
+        int wait_ms = timeout_ms - waited_ms;
+        int wait_rc;
+
+        if (wait_ms > step_ms) {
+            wait_ms = step_ms;
+        }
+        wait_rc = video_uploader_wait(uploader, wait_ms);
+        if (wait_rc != 0) {
+            return wait_rc;
+        }
+        waited_ms += wait_ms;
+
+        if (video_uploader_tcp_reachable(VIDEO_UPLOADER_HTTP_UPLOAD_URL, 500)) {
+            printf("[VideoUploader] upload server reachable, resume pending upload now\n");
+            return 0;
+        }
     }
 
     return 0;
@@ -409,10 +548,21 @@ static int video_uploader_handle_one(VideoUploader *uploader) {
         snprintf(error_msg, sizeof(error_msg), "upload callback failed: %d", upload_rc);
     }
 
+    if (upload_rc == ENOENT) {
+        rc = local_store_delete_video_segment(&uploader->store, segment.id);
+        if (rc == 0) {
+            printf("[VideoUploader] Drop missing local segment id=%lld path=%s\n",
+                   (long long)segment.id,
+                   segment.file_path);
+        }
+        return rc;
+    }
+
     rc = local_store_mark_video_segment_retry(&uploader->store, segment.id, error_msg);
     if (rc == 0) {
-        printf("[VideoUploader] Upload failed, segment id=%lld, error=%s\n",
+        printf("[VideoUploader] Upload failed, segment id=%lld retry=%d, error=%s\n",
                (long long)segment.id,
+               segment.retry_count + 1,
                error_msg);
     }
     if (rc != 0) {
@@ -458,9 +608,11 @@ static void *video_uploader_thread(void *arg) {
             continue;
         }
 
-        if (rc != 0) {
-            video_uploader_increase_backoff(uploader);
-            wait_rc = video_uploader_wait(uploader, uploader->retry_backoff_ms);
+          if (rc != 0) {
+              video_uploader_increase_backoff(uploader);
+            printf("[VideoUploader] retry in %d ms, pending segments remain cached locally\n",
+                   uploader->retry_backoff_ms);
+            wait_rc = video_uploader_wait_retry_or_network(uploader, uploader->retry_backoff_ms);
             if (wait_rc == 1) {
                 break;
             }
@@ -647,6 +799,8 @@ int video_uploader_http_upload_callback(const LocalVideoSegmentRecord *segment,
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, cfg.connect_timeout_sec);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, cfg.request_timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, cfg.low_speed_limit_bps);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, cfg.low_speed_time_sec);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, video_uploader_http_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);

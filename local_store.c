@@ -729,7 +729,7 @@ int local_store_fetch_oldest_prunable_video_segment(LocalStore *store,
         "state, file_path, created_at_ms, last_error, remote_path "
         "FROM video_segments "
         "WHERE state IN ('uploaded', 'pending', 'broken') "
-        "ORDER BY start_ms ASC LIMIT 1;",
+        "ORDER BY retry_count ASC, start_ms ASC LIMIT 1;",
         -1,
         &stmt,
         NULL);
@@ -770,7 +770,7 @@ int local_store_fetch_oldest_pending_video_segment(LocalStore *store,
         "state, file_path, created_at_ms, last_error, remote_path "
         "FROM video_segments "
         "WHERE state = 'pending' "
-        "ORDER BY start_ms ASC LIMIT 1;",
+        "ORDER BY retry_count ASC, start_ms ASC LIMIT 1;",
         -1,
         &stmt,
         NULL);

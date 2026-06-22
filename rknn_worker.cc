@@ -254,7 +254,7 @@ static void *infer_thread_main(void *arg) {
 extern "C" void rknn_worker_config_defaults(RknnWorkerConfig *config) {
     memset(config, 0, sizeof(*config));
     config->model_path = "/root/model/best_fp16.rknn";
-    config->conf_threshold = 0.65f;
+    config->conf_threshold = 0.50f;
     config->nms_threshold = 0.45f;
 }
 

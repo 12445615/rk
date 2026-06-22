@@ -751,42 +751,8 @@ static void draw_detect_zones(FFmpegStreamer *s,
     }
 
     (void)dst;
+    draw_overlay_zone_quad_red(s, &zone_state->work_zone, 4);
     draw_overlay_zone_quad_red(s, &zone_state->danger_zone, 4);
-    if (zone_state->work_zone.p0x != 0.0f ||
-        zone_state->work_zone.p1x != 0.0f ||
-        zone_state->work_zone.p2x != 0.0f ||
-        zone_state->work_zone.p3x != 0.0f) {
-        draw_overlay_zone_quad_black(s, &zone_state->work_zone, 3);
-    } else {
-        nv12_fill_rect(s,
-                       (int)(zone_state->work_zone.x1 + 0.5f),
-                       (int)(zone_state->work_zone.y1 + 0.5f),
-                       (int)(zone_state->work_zone.x2 - zone_state->work_zone.x1 + 0.5f),
-                       4,
-                       16,
-                       128);
-        nv12_fill_rect(s,
-                       (int)(zone_state->work_zone.x1 + 0.5f),
-                       (int)(zone_state->work_zone.y2 + 0.5f) - 4,
-                       (int)(zone_state->work_zone.x2 - zone_state->work_zone.x1 + 0.5f),
-                       4,
-                       16,
-                       128);
-        nv12_fill_rect(s,
-                       (int)(zone_state->work_zone.x1 + 0.5f),
-                       (int)(zone_state->work_zone.y1 + 0.5f),
-                       4,
-                       (int)(zone_state->work_zone.y2 - zone_state->work_zone.y1 + 0.5f),
-                       16,
-                       128);
-        nv12_fill_rect(s,
-                       (int)(zone_state->work_zone.x2 + 0.5f) - 4,
-                       (int)(zone_state->work_zone.y1 + 0.5f),
-                       4,
-                       (int)(zone_state->work_zone.y2 - zone_state->work_zone.y1 + 0.5f),
-                       16,
-                       128);
-    }
 }
 
 
